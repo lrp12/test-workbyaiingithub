@@ -184,17 +184,6 @@ jobs:
       - name: 扫描并更新requirements.txt
         id: deps
         run: |
-          python .ai/update_requirements.py --scan-path . --output requirements-ai.txt
-          if [ -n "$(git status --porcelain requirements-ai.txt)" ]; then
-            echo "DEP_UPDATED=true" >> "$GITHUB_OUTPUT"
-            echo "📦 依赖已更新"
-          else
-            echo "DEP_UPDATED=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: 扫描并更新requirements.txt
-        id: deps
-        run: |
           # 确保脚本可执行
           chmod +x .ai/update_requirements.py
           
