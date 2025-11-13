@@ -191,6 +191,23 @@ jobs:
           else
             echo "DEP_UPDATED=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: 扫描并更新requirements.txt
+        id: deps
+        run: |
+          # 确保脚本可执行
+          chmod +x .ai/update_requirements.py
+          
+          # 执行扫描（扫描src目录及生成的目标文件所在目录）
+          python .ai/update_requirements.py --scan-path . --output requirements-ai.txt
+          
+          # 检查是否有变更
+          if [ -n "$(git status --porcelain requirements-ai.txt)" ]; then
+            echo "DEP_UPDATED=true" >> "$GITHUB_OUTPUT"
+            echo "📦 依赖已更新"
+          else
+            echo "DEP_UPDATED=false" >> "$GITHUB_OUTPUT"
+          fi
       
       - name: 创建Pull Request
         uses: peter-evans/create-pull-request@v6
@@ -213,20 +230,3 @@ jobs:
           commit-message: |
             feat: Kimi优化 ${{ steps.parse.outputs.TARGET_FILE }}
             ${{ steps.deps.outputs.DEP_UPDATED == 'true' && '\nbuild: 自动更新依赖' || '' }}
-
-      - name: 扫描并更新requirements.txt
-        id: deps
-        run: |
-          # 确保脚本可执行
-          chmod +x .ai/update_requirements.py
-          
-          # 执行扫描（扫描src目录及生成的目标文件所在目录）
-          python .ai/update_requirements.py --scan-path . --output requirements-ai.txt
-          
-          # 检查是否有变更
-          if [ -n "$(git status --porcelain requirements-ai.txt)" ]; then
-            echo "DEP_UPDATED=true" >> "$GITHUB_OUTPUT"
-            echo "📦 依赖已更新"
-          else
-            echo "DEP_UPDATED=false" >> "$GITHUB_OUTPUT"
-          fi
