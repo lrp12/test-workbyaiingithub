@@ -1,12 +1,13 @@
-name: 🤖 Kimi AI全自动优化
+name: 🤖 Kimi AI全自动优化与修订
 
 on:
   issue_comment:
     types: [created]
 
 jobs:
+  # 处理 Issue 中的优化指令（创建新PR）
   ai-optimize:
-    if: contains(github.event.comment.body, '@kimi-bot optimize')
+    if: contains(github.event.comment.body, '@kimi-bot optimize') && !github.event.issue.pull_request
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -37,18 +38,12 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements-ai.txt
       
-      # ✅ 修复1：移除不必要的base64编码，直接输出纯文本
       - name: 解析优化指令
         id: parse
         run: |
-          # 清理评论内容
           CLEAN_COMMENT=$(echo "${{ github.event.comment.body }}" | sed 's/@kimi-bot optimize//gi' | sed 's/```//g')
-          
-          # 提取文件路径（支持多种格式）
           FILE_NAME=$(echo "$CLEAN_COMMENT" | grep -oP '文件[:：]\s*\K[^\s]+' | head -1 || echo "src/main.py")
           FILE_NAME=$(echo "$FILE_NAME" | tr -d '`')
-          
-          # 移除文件指令行，保留纯需求描述
           INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed '/文件[:：]/d')
           
           echo "INSTRUCTION<<EOF" >> "$GITHUB_OUTPUT"
@@ -65,7 +60,6 @@ jobs:
           TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
           if [ -f "$TARGET_FILE" ]; then
             echo "CODE_EXISTS=true" >> "$GITHUB_OUTPUT"
-            # 读取文件内容（不编码）
             CODE=$(cat "$TARGET_FILE")
             echo "CODE<<EOF" >> "$GITHUB_OUTPUT"
             echo "$CODE" >> "$GITHUB_OUTPUT"
@@ -81,11 +75,9 @@ jobs:
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
         run: |
-          # ✅ 修复：使用printf安全读取（避免特殊字符破坏Shell语法）
           INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.INSTRUCTION }}')
           CODE_EXISTS="${{ steps.current.outputs.CODE_EXISTS }}"
           
-          # ✅ 修复：使用printf构建提示词（安全处理括号等特殊字符）
           if [ "$CODE_EXISTS" == "true" ]; then
             CODE=$(printf '%s' '${{ steps.current.outputs.CODE }}')
             PROMPT=$(printf '基于以下代码优化：\n\n%s\n\n要求：\n%s\n\n直接返回代码，不要解释。' "$CODE" "$INSTRUCTION")
@@ -93,7 +85,6 @@ jobs:
             PROMPT=$(printf '根据要求生成代码：\n\n%s\n\n直接返回代码。' "$INSTRUCTION")
           fi
           
-          # ✅ 使用jq -n --arg安全传递变量（自动处理转义）
           PAYLOAD=$(jq -n \
             --arg prompt "$PROMPT" \
             --arg model "kimi-k2-0905-preview" \
@@ -106,17 +97,14 @@ jobs:
               "temperature": 0.3
             }')
           
-          # 调用API并保存响应
           RESPONSE=$(curl -s -w "\n%{http_code}" https://api.moonshot.cn/v1/chat/completions \
             -H "Authorization: Bearer $KIMI_API_KEY" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
           
-          # 分离响应体和状态码
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
           
-          # ✅ 保存原始响应到kimi文件夹
           mkdir -p kimi
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
           ISSUE_NUM=${{ github.event.issue.number }}
@@ -124,17 +112,13 @@ jobs:
           echo "$RESPONSE_BODY" > "$RESPONSE_FILE"
           echo "💾 原始响应已保存: $RESPONSE_FILE"
           
-          # 错误处理
           if [ "$HTTP_CODE" != "200" ]; then
             echo "❌ API调用失败，状态码: $HTTP_CODE"
             echo "响应内容: $RESPONSE_BODY"
             exit 1
           fi
           
-          # ✅ 解析并清理代码
           OPTIMIZED_CODE=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // empty')
-          
-          # 移除可能的markdown代码块标记
           OPTIMIZED_CODE=$(echo "$OPTIMIZED_CODE" | sed '/^```/d')
           
           if [ -z "$OPTIMIZED_CODE" ] || [ "$OPTIMIZED_CODE" == "null" ]; then
@@ -159,38 +143,78 @@ jobs:
           mkdir -p .ai
           if [ ! -f ".ai/update_requirements.py" ]; then
             cat > .ai/update_requirements.py << 'EOF'
-          import os
-          import sys
-          import argparse
+          #!/usr/bin/env python3
+          """
+          智能依赖扫描脚本
+          自动分析Python文件中的import语句，更新requirements-ai.txt
+          """
+          import os, re, sys
+          from pathlib import Path
+          
+          STANDARD_LIBS = {'os', 'sys', 'time', 'datetime', 'json', 're', 'math', 'random', 'string', 'pathlib', 'subprocess', 'threading', 'multiprocessing', 'collections', 'itertools', 'functools', 'typing', 'inspect', 'hashlib', 'base64', 'csv', 'io', 'pickle', 'sqlite3', 'uuid', 'warnings', 'logging', 'argparse', 'configparser', 'html', 'http', 'urllib', 'ftplib', 'smtplib', 'email', 'xml', 'zipfile', 'tarfile', 'gzip', 'bz2', 'lzma', 'shutil', 'tempfile', 'mimetypes', 'getpass', 'secrets', 'hmac', 'ssl', 'socket', 'select', 'asyncio', 'concurrent', 'ctypes', 'decimal', 'fractions', 'numbers', 'statistics', 'enum', 'dataclasses', 'contextlib', 'pprint', 'textwrap', 'fnmatch', 'glob', 'linecache', 'traceback', 'cProfile', 'profile', 'pstats', 'timeit', 'trace', 'doctest'}
+          COMMON_PACKAGES = {'requests': 'requests>=2.31.0', 'pytest': 'pytest==7.4.3', 'radon': 'radon==6.0.1', 'numpy': 'numpy>=1.24.0', 'pandas': 'pandas>=2.0.0', 'beautifulsoup4': 'beautifulsoup4>=4.12.0', 'lxml': 'lxml>=4.9.0', 'scrapy': 'scrapy>=2.9.0', 'selenium': 'selenium>=4.10.0', 'flask': 'flask>=2.3.0', 'django': 'django>=4.2.0', 'fastapi': 'fastapi>=0.100.0', 'pydantic': 'pydantic>=2.0.0', 'sqlalchemy': 'sqlalchemy>=2.0.0'}
+          
+          def extract_imports(file_path):
+              imports = set()
+              try:
+                  with open(file_path, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                  imports.update(re.findall(r'^\s*import\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*', content, re.MULTILINE))
+                  imports.update(re.findall(r'^\s*from\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+import', content, re.MULTILINE))
+              except Exception as e:
+                  print(f"⚠️  读取文件失败 {file_path}: {e}", file=sys.stderr)
+              return imports
+          
+          def scan_directory(scan_path):
+              all_imports, python_files = set(), list(Path(scan_path).rglob("*.py"))
+              print(f"🔍 扫描Python文件: 找到 {len(python_files)} 个文件")
+              for py_file in python_files:
+                  if any(skip in str(py_file) for skip in ['.git', '__pycache__', 'venv', '.venv', '.ai']):
+                      continue
+                  imports = extract_imports(py_file)
+                  if imports:
+                      print(f"  📄 {py_file.relative_to(scan_path)}: {', '.join(imports)}")
+                  all_imports.update(imports)
+              return all_imports
+          
+          def filter_third_party(imports):
+              return sorted([imp for imp in imports if imp not in STANDARD_LIBS and not imp.startswith('_')])
+          
+          def generate_requirements(third_party_libs, output_file):
+              lines = ["# AI工作流依赖（自动生成）", "# 更新时间: " + __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'), ""]
+              lines.extend([COMMON_PACKAGES.get(lib, lib) for lib in third_party_libs])
+              with open(output_file, 'w', encoding='utf-8') as f:
+                  f.write('\n'.join(lines))
+              print(f"\n✅ 依赖文件已更新: {output_file}")
+              print(f"📦 检测到 {len(third_party_libs)} 个第三方库:")
+              for lib in third_party_libs:
+                  print(f"   - {lib}")
           
           def main():
-            parser = argparse.ArgumentParser()
-            parser.add_argument('--scan-path', required=True)
-            parser.add_argument('--output', required=True)
-            args = parser.parse_args()
-            
-            deps = ["pytest==7.4.3", "radon==6.0.1"]
-            with open(args.output, 'w') as f:
-              f.write("# AI工作流依赖（自动生成）\\n")
-              for dep in deps:
-                f.write(f"{dep}\\n")
-            print(f"✅ 依赖文件已更新: {args.output}")
+              parser = argparse.ArgumentParser(description='智能扫描Python依赖')
+              parser.add_argument('--scan-path', required=True)
+              parser.add_argument('--output', required=True)
+              args = parser.parse_args()
+              if not os.path.isdir(args.scan_path):
+                  print(f"❌ 错误: 扫描路径不存在 - {args.scan_path}", file=sys.stderr)
+                  sys.exit(1)
+              print(f"📂 开始扫描目录: {args.scan_path}")
+              all_imports = scan_directory(args.scan_path)
+              print(f"\n📊 总计发现 {len(all_imports)} 个不同的 import")
+              third_party = filter_third_party(all_imports)
+              if third_party:
+                  generate_requirements(third_party, args.output)
           
-          if __name__ == "__main__":
-            main()
+          if __name__ == '__main__':
+              main()
           EOF
           fi
       
-      - name: 扫描并更新requirements.txt
+      - name: 扫描并更新依赖
         id: deps
         run: |
-          # 确保脚本可执行
           chmod +x .ai/update_requirements.py
-          
-          # 执行扫描（扫描src目录及生成的目标文件所在目录）
           python .ai/update_requirements.py --scan-path . --output requirements-ai.txt
-          
-          # 检查是否有变更
           if [ -n "$(git status --porcelain requirements-ai.txt)" ]; then
             echo "DEP_UPDATED=true" >> "$GITHUB_OUTPUT"
             echo "📦 依赖已更新"
@@ -219,3 +243,182 @@ jobs:
           commit-message: |
             feat: Kimi优化 ${{ steps.parse.outputs.TARGET_FILE }}
             ${{ steps.deps.outputs.DEP_UPDATED == 'true' && '\nbuild: 自动更新依赖' || '' }}
+
+  # 处理 PR 中的修订指令（更新现有PR）
+  ai-revise:
+    if: contains(github.event.comment.body, '@kimi-bot revise') && github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ✅ 关键：检出PR分支而非main分支
+          ref: ${{ github.event.issue.pull_request.head.ref }}
+      
+      - name: 确保依赖文件存在
+        run: |
+          if [ ! -f "requirements-ai.txt" ]; then
+            echo "# AI工作流依赖（自动生成）" > requirements-ai.txt
+            echo "# 占位文件，将被自动扫描更新" >> requirements-ai.txt
+            echo "pytest==7.4.3" >> requirements-ai.txt
+            echo "radon==6.0.1" >> requirements-ai.txt
+          fi
+      
+      - name: 设置Python环境并启用缓存
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-ai.txt
+      
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-ai.txt
+      
+      - name: 解析修订指令
+        id: parse
+        run: |
+          CLEAN_COMMENT=$(echo "${{ github.event.comment.body }}" | sed 's/@kimi-bot revise//gi' | sed 's/```//g')
+          INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          
+          # 默认修订PR中第一个被修改的文件
+          DEFAULT_FILE=$(git diff --name-only ${{ github.event.issue.pull_request.base.sha }}...HEAD | grep '\.py$' | head -1 || echo "src/main.py")
+          
+          # 如果用户指定了文件
+          FILE_NAME=$(echo "$CLEAN_COMMENT" | grep -oP '文件[:：]\s*\K[^\s]+' | head -1 || echo "$DEFAULT_FILE")
+          FILE_NAME=$(echo "$FILE_NAME" | tr -d '`')
+          
+          echo "INSTRUCTION<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$INSTRUCTION" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "TARGET_FILE=$FILE_NAME" >> "$GITHUB_OUTPUT"
+          echo "PR_NUMBER=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          
+          echo "📄 修订文件: $FILE_NAME"
+          echo "📝 修订指令: $INSTRUCTION"
+      
+      - name: 读取当前代码
+        id: current
+        run: |
+          TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
+          if [ -f "$TARGET_FILE" ]; then
+            CODE=$(cat "$TARGET_FILE")
+            echo "CODE<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$CODE" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "✅ 读取文件: $TARGET_FILE"
+          else
+            echo "❌ 文件不存在: $TARGET_FILE"
+            exit 1
+          fi
+      
+      - name: Kimi生成修订代码
+        id: ai
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+        run: |
+          CODE=$(printf '%s' '${{ steps.current.outputs.CODE }}')
+          INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.INSTRUCTION }}')
+          
+          PROMPT=$(printf '基于以下代码进行修订：\n\n%s\n\n修订要求：\n%s\n\n直接返回完整的修订后代码，不要解释。' "$CODE" "$INSTRUCTION")
+          
+          PAYLOAD=$(jq -n \
+            --arg prompt "$PROMPT" \
+            --arg model "kimi-k2-0905-preview" \
+            '{
+              "model": $model,
+              "messages": [
+                {"role": "system", "content": "你是资深代码专家，返回纯代码，不要markdown标记。"},
+                {"role": "user", "content": $prompt}
+              ],
+              "temperature": 0.3
+            }')
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.moonshot.cn/v1/chat/completions \
+            -H "Authorization: Bearer $KIMI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          mkdir -p kimi
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          ISSUE_NUM=${{ github.event.issue.number }}
+          RESPONSE_FILE="kimi/revise_response_${ISSUE_NUM}_${TIMESTAMP}.json"
+          echo "$RESPONSE_BODY" > "$RESPONSE_FILE"
+          echo "💾 修订响应已保存: $RESPONSE_FILE"
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ API调用失败，状态码: $HTTP_CODE"
+            echo "响应内容: $RESPONSE_BODY"
+            exit 1
+          fi
+          
+          OPTIMIZED_CODE=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // empty')
+          OPTIMIZED_CODE=$(echo "$OPTIMIZED_CODE" | sed '/^```/d')
+          
+          if [ -z "$OPTIMIZED_CODE" ] || [ "$OPTIMIZED_CODE" == "null" ]; then
+            echo "⚠️ 警告: 未获取到有效修订代码"
+            echo "完整响应: $RESPONSE_BODY"
+            OPTIMIZED_CODE="${{ steps.current.outputs.CODE }}"
+          fi
+          
+          echo "OPTIMIZED_CODE<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$OPTIMIZED_CODE" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+      
+      - name: 更新文件
+        run: |
+          TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
+          echo "${{ steps.ai.outputs.OPTIMIZED_CODE }}" > "$TARGET_FILE"
+          echo "✅ 文件已修订: $TARGET_FILE"
+      
+      - name: 扫描并更新依赖
+        id: deps
+        run: |
+          chmod +x .ai/update_requirements.py
+          python .ai/update_requirements.py --scan-path . --output requirements-ai.txt
+          if [ -n "$(git status --porcelain requirements-ai.txt)" ]; then
+            echo "DEP_UPDATED=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "DEP_UPDATED=false" >> "$GITHUB_OUTPUT"
+          fi
+      
+      - name: 提交修订到当前PR
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add .
+          git commit -m "🤖 Kimi修订: ${{ steps.parse.outputs.TARGET_FILE }} (${{ github.event.comment.id }})" || echo "无更改"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 添加修订反馈评论
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.issue.number;
+            const filePath = '${{ steps.parse.outputs.TARGET_FILE }}';
+            const depUpdated = '${{ steps.deps.outputs.DEP_UPDATED }}' === 'true';
+            const depInfo = depUpdated ? '\n**依赖更新**: requirements-ai.txt 已自动更新' : '';
+            
+            const body = `## 🤖 Kimi修订完成
+            
+            **修订文件**: \`${filePath}\`
+            **修订指令**: ${{ steps.parse.outputs.INSTRUCTION }}
+            ${depInfo}
+            
+            ✅ 代码已更新并提交到本PR分支。`;
+            
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
