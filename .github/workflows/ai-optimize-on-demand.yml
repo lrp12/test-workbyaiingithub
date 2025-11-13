@@ -37,32 +37,71 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements-ai.txt
       
-      - name: 解析优化指令
+      - name: 解析优化指令（智能识别文件）
         id: parse
         run: |
           CLEAN_COMMENT=$(echo "${{ github.event.comment.body }}" | sed 's/@kimi-bot optimize//gi' | sed 's/```//g')
-          FILE_NAME=$(echo "$CLEAN_COMMENT" | grep -oP '文件[:：]\s*\K[^\s]+' | head -1 || echo "src/main.py")
-          FILE_NAME=$(echo "$FILE_NAME" | tr -d '`')
           INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed '/文件[:：]/d')
           
-          echo "INSTRUCTION_B64=$(echo "$INSTRUCTION" | base64 -w0)" >> "$GITHUB_OUTPUT"
-          echo "TARGET_FILE=$FILE_NAME" >> "$GITHUB_OUTPUT"
+          # ✅ 智能文件识别逻辑
+          if echo "$CLEAN_COMMENT" | grep -qP '文件夹[:：]\s*\K[^\s]+'; then
+            # 情况1: 用户指定文件夹（批量处理）
+            FOLDER=$(echo "$CLEAN_COMMENT" | grep -oP '文件夹[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
+            FILES=$(find "$FOLDER" -name "*.py" -type f 2>/dev/null || echo "")
+            if [ -z "$FILES" ]; then
+              echo "❌ 文件夹不存在或无Python文件: $FOLDER"
+              exit 1
+            fi
+            echo "FILES_LIST<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$FILES" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "MODE=folder" >> "$GITHUB_OUTPUT"
+            echo "📁 批量处理文件夹: $FOLDER"
+          elif echo "$CLEAN_COMMENT" | grep -qP '文件[:：]\s*\K[^\s]+'; then
+            # 情况2: 用户指定文件
+            FILE_NAME=$(echo "$CLEAN_COMMENT" | grep -oP '文件[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
+            echo "TARGET_FILE=$FILE_NAME" >> "$GITHUB_OUTPUT"
+            echo "MODE=file" >> "$GITHUB_OUTPUT"
+            echo "📄 指定目标文件: $FILE_NAME"
+          else
+            # 情况3: 自动检测（优化场景）
+            if [ -f "src/main.py" ]; then
+              FILE_NAME="src/main.py"
+            elif [ -f "main.py" ]; then
+              FILE_NAME="main.py"
+            else
+              FILE_NAME=$(find . -name "*.py" -not -path "./.*" -not -path "./venv/*" -not -path "./.venv/*" -not -path "./kimi/*" | head -1 | sed 's|^\./||')
+            fi
+            echo "TARGET_FILE=${FILE_NAME:-src/main.py}" >> "$GITHUB_OUTPUT"
+            echo "MODE=file" >> "$GITHUB_OUTPUT"
+            echo "🔍 自动检测目标文件: ${FILE_NAME:-src/main.py}"
+          fi
           
-          echo "📄 目标文件: $FILE_NAME"
-          echo "📝 指令: $INSTRUCTION"
+          echo "INSTRUCTION_B64=$(echo "$INSTRUCTION" | base64 -w0)" >> "$GITHUB_OUTPUT"
       
-      - name: 读取待优化代码
+      - name: 读取待优化代码（支持批量）
         id: current
         run: |
-          TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
-          if [ -f "$TARGET_FILE" ]; then
-            CODE_B64=$(base64 -w0 < "$TARGET_FILE")
+          MODE="${{ steps.parse.outputs.MODE }}"
+          
+          if [ "$MODE" == "folder" ]; then
+            # 批量读取文件夹内所有文件
+            FILES_LIST='${{ steps.parse.outputs.FILES_LIST }}'
             echo "CODE_EXISTS=true" >> "$GITHUB_OUTPUT"
-            echo "CODE_B64=$CODE_B64" >> "$GITHUB_OUTPUT"
-            echo "✅ 找到文件: $TARGET_FILE"
+            echo "FILES_LIST_B64=$(echo "$FILES_LIST" | base64 -w0)" >> "$GITHUB_OUTPUT"
+            echo "✅ 批量模式，准备处理 $(echo "$FILES_LIST" | wc -l) 个文件"
           else
-            echo "CODE_EXISTS=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️ 文件不存在: $TARGET_FILE"
+            # 单文件模式
+            TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
+            if [ -f "$TARGET_FILE" ]; then
+              CODE_B64=$(base64 -w0 < "$TARGET_FILE")
+              echo "CODE_EXISTS=true" >> "$GITHUB_OUTPUT"
+              echo "CODE_B64=$CODE_B64" >> "$GITHUB_OUTPUT"
+              echo "✅ 找到文件: $TARGET_FILE"
+            else
+              echo "CODE_EXISTS=false" >> "$GITHUB_OUTPUT"
+              echo "⚠️ 文件不存在: $TARGET_FILE"
+            fi
           fi
       
       - name: Kimi生成优化代码
@@ -72,8 +111,20 @@ jobs:
         run: |
           INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.INSTRUCTION_B64 }}' | base64 -d)
           CODE_EXISTS="${{ steps.current.outputs.CODE_EXISTS }}"
+          MODE="${{ steps.parse.outputs.MODE }}"
           
-          if [ "$CODE_EXISTS" == "true" ]; then
+          if [ "$MODE" == "folder" ]; then
+            # 批量处理（简化版：处理第一个文件，后续可扩展循环）
+            FILES_LIST=$(printf '%s' '${{ steps.current.outputs.FILES_LIST_B64 }}' | base64 -d)
+            FIRST_FILE=$(echo "$FILES_LIST" | head -1)
+            if [ -f "$FIRST_FILE" ]; then
+              CODE=$(base64 -w0 < "$FIRST_FILE" | base64 -d)
+              PROMPT=$(printf '批量处理文件夹，优先优化此文件：\n\n%s\n\n要求：\n%s\n\n直接返回代码，不要解释。' "$CODE" "$INSTRUCTION")
+              echo "TARGET_FILE=$FIRST_FILE" >> "$GITHUB_OUTPUT"
+            else
+              PROMPT=$(printf '根据要求生成代码：\n\n%s\n\n直接返回代码。' "$INSTRUCTION")
+            fi
+          elif [ "$CODE_EXISTS" == "true" ]; then
             CODE=$(printf '%s' '${{ steps.current.outputs.CODE_B64 }}' | base64 -d)
             PROMPT=$(printf '基于以下代码优化：\n\n%s\n\n要求：\n%s\n\n直接返回代码，不要解释。' "$CODE" "$INSTRUCTION")
           else
@@ -117,9 +168,19 @@ jobs:
       - name: 创建/更新目标文件
         run: |
           TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
-          mkdir -p $(dirname "$TARGET_FILE")
-          printf '%s' '${{ steps.ai.outputs.OPTIMIZED_CODE_B64 }}' | base64 -d > "$TARGET_FILE"
-          echo "✅ 文件已生成/更新: $TARGET_FILE"
+          MODE="${{ steps.parse.outputs.MODE }}"
+          
+          if [ "$MODE" == "folder" ]; then
+            # TODO: 扩展批量写入逻辑（当前简化处理）
+            FILES_LIST=$(printf '%s' '${{ steps.current.outputs.FILES_LIST_B64 }}' | base64 -d)
+            FIRST_FILE=$(echo "$FILES_LIST" | head -1)
+            printf '%s' '${{ steps.ai.outputs.OPTIMIZED_CODE_B64 }}' | base64 -d > "$FIRST_FILE"
+            echo "✅ 批量模式 - 已更新第一个文件: $FIRST_FILE"
+          else
+            mkdir -p $(dirname "$TARGET_FILE")
+            printf '%s' '${{ steps.ai.outputs.OPTIMIZED_CODE_B64 }}' | base64 -d > "$TARGET_FILE"
+            echo "✅ 文件已生成/更新: $TARGET_FILE"
+          fi
       
       - name: 确保更新脚本存在
         run: |
@@ -338,25 +399,110 @@ jobs:
       - name: 安装依赖
         run: pip install --upgrade pip && pip install -r requirements-ai.txt
       
-      - name: 解析修订指令
+      - name: 解析修订指令（智能识别）
         id: parse
         run: |
-          CLEAN_COMMENT=$(echo "${{ github.event.comment.body }}" | sed 's/@kimi-bot revise//gi' | sed 's/```//g')
-          INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-          DEFAULT_FILE=$(git diff --name-only ${{ github.event.issue.pull_request.base.sha }}...HEAD | grep '\.py$' | head -1 || echo "src/main.py")
-          FILE_NAME=$(echo "$CLEAN_COMMENT" | grep -oP '文件[:：]\s*\K[^\s]+' | head -1 || echo "$DEFAULT_FILE")
-          FILE_NAME=$(echo "$FILE_NAME" | tr -d '`')
+          # ✅ 添加调试输出
+          echo "📝 原始评论: ${{ github.event.comment.body }}"
           
-          echo "INSTRUCTION_B64=$(echo "$INSTRUCTION" | base64 -w0)" >> "$GITHUB_OUTPUT"
+          CLEAN_COMMENT=$(echo "${{ github.event.comment.body }}" | sed 's/@kimi-bot revise//gi' | sed 's/```//g')
+          echo "清理后评论: '$CLEAN_COMMENT'"
+          
+          INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          echo "提取指令: '$INSTRUCTION'"
+          
+          # 智能文件识别函数
+          get_smart_file() {
+            # 优先级1: 用户指定文件
+            USER_FILE=$(echo "$CLEAN_COMMENT" | grep -oP '文件[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
+            if [ -n "$USER_FILE" ] && [ -f "$USER_FILE" ]; then
+              echo "$USER_FILE"
+              echo "检测模式: 用户指定" >> /dev/stderr
+              return 0
+            fi
+            
+            # 优先级2: 用户指定文件夹（TODO: 扩展批量处理）
+            USER_FOLDER=$(echo "$CLEAN_COMMENT" | grep -oP '文件夹[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
+            if [ -n "$USER_FOLDER" ]; then
+              FIRST_PY=$(find "$USER_FOLDER" -name "*.py" -type f -not -path "*/\.*" | head -1)
+              if [ -n "$FIRST_PY" ]; then
+                echo "$FIRST_PY"
+                echo "检测模式: 用户指定文件夹" >> /dev/stderr
+                return 0
+              fi
+            fi
+            
+            # 优先级3: PR中最近修改的文件
+            if [ -n "${{ github.event.issue.pull_request.base.sha }}" ]; then
+              CHANGED_FILE=$(git diff --name-only ${{ github.event.issue.pull_request.base.sha }}...HEAD | grep '\.py$' | head -1)
+              if [ -n "$CHANGED_FILE" ] && [ -f "$CHANGED_FILE" ]; then
+                echo "$CHANGED_FILE"
+                echo "检测模式: PR变更" >> /dev/stderr
+                return 0
+              fi
+            fi
+            
+            # 优先级4: 工作区最近修改的文件
+            RECENT_FILE=$(find . -name "*.py" -type f -not -path "./.*" -not -path "./venv/*" -not -path "./.venv/*" -not -path "./kimi/*" -mmin -10080 | head -1 | sed 's|^\./||')
+            if [ -n "$RECENT_FILE" ]; then
+              echo "$RECENT_FILE"
+              echo "检测模式: 最近修改" >> /dev/stderr
+              return 0
+            fi
+            
+            # 优先级5: 默认文件
+            if [ -f "src/main.py" ]; then
+              echo "src/main.py"
+              echo "检测模式: 默认src/main.py" >> /dev/stderr
+            elif [ -f "main.py" ]; then
+              echo "main.py"
+              echo "检测模式: 默认main.py" >> /dev/stderr
+            else
+              # 最终手段：任意Python文件
+              ANY_PY=$(find . -name "*.py" -type f -not -path "./.*" -not -path "./venv/*" -not -path "./.venv/*" -not -path "./kimi/*" | head -1 | sed 's|^\./||')
+              if [ -n "$ANY_PY" ]; then
+                echo "$ANY_PY"
+                echo "检测模式: 首个可用文件" >> /dev/stderr
+              else
+                echo "❌ 错误: 无法找到任何Python文件" >> /dev/stderr
+                return 1
+              fi
+            fi
+          }
+          
+          # 执行智能检测
+          FILE_NAME=$(get_smart_file)
+          if [ $? -ne 0 ] || [ -z "$FILE_NAME" ]; then
+            echo "❌ 致命错误: 无法确定目标文件"
+            exit 1
+          fi
+          
+          echo "最终目标文件: $FILE_NAME"
           echo "TARGET_FILE=$FILE_NAME" >> "$GITHUB_OUTPUT"
+          echo "MODE=file" >> "$GITHUB_OUTPUT"
+          echo "INSTRUCTION_B64=$(echo "$INSTRUCTION" | base64 -w0)" >> "$GITHUB_OUTPUT"
           echo "PR_NUMBER=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
       
       - name: 读取当前代码
         id: current
         run: |
           TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
+          
+          if [ -z "$TARGET_FILE" ]; then
+            echo "❌ 致命错误: TARGET_FILE为空"
+            exit 1
+          fi
+          
+          if [ ! -f "$TARGET_FILE" ]; then
+            echo "❌ 文件不存在: $TARGET_FILE"
+            echo "当前目录结构:"
+            find . -name "*.py" -type f -not -path "./.*" -not -path "./venv/*" -not -path "./.venv/*" -not -path "./kimi/*" | head -20
+            exit 1
+          fi
+          
           CODE_B64=$(base64 -w0 < "$TARGET_FILE")
           echo "CODE_B64=$CODE_B64" >> "$GITHUB_OUTPUT"
+          echo "✅ 成功读取文件: $TARGET_FILE ($(wc -c < "$TARGET_FILE") 字节)"
       
       - name: Kimi生成修订代码
         id: ai
@@ -405,6 +551,7 @@ jobs:
         run: |
           TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
           printf '%s' '${{ steps.ai.outputs.OPTIMIZED_CODE_B64 }}' | base64 -d > "$TARGET_FILE"
+          echo "✅ 文件已更新: $TARGET_FILE"
       
       - name: 扫描并更新依赖
         id: deps
@@ -433,15 +580,7 @@ jobs:
             const filePath = '${{ steps.parse.outputs.TARGET_FILE }}';
             const depUpdated = '${{ steps.deps.outputs.DEP_UPDATED }}' === 'true';
             const depInfo = depUpdated ? '\n**依赖更新**: requirements-ai.txt 已自动更新' : '';
-            
-            const body = `## 🤖 Kimi修订完成
-            
-            **修订文件**: \`${filePath}\`
-            **修订指令**: 已处理
-            ${depInfo}
-            
-            ✅ 代码已更新并提交到本PR分支。`;
-            
+            const body = `## 🤖 Kimi修订完成\n\n**修订文件**: \`${filePath}\`\n**修订指令**: 已处理\n${depInfo}\n\n✅ 代码已更新并提交到本PR分支。`;
             github.rest.issues.createComment({
               issue_number: prNumber,
               owner: context.repo.owner,
