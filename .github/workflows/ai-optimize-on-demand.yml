@@ -76,24 +76,24 @@ jobs:
             echo "⚠️ 文件不存在: $TARGET_FILE"
           fi
       
-      # ✅ 修复2：直接使用纯文本，仅在jq中处理JSON转义
       - name: Kimi生成优化代码
         id: ai
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
         run: |
-          INSTRUCTION='${{ steps.parse.outputs.INSTRUCTION }}'
+          # ✅ 修复：使用printf安全读取（避免特殊字符破坏Shell语法）
+          INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.INSTRUCTION }}')
           CODE_EXISTS="${{ steps.current.outputs.CODE_EXISTS }}"
           
-          # 构建提示词
+          # ✅ 修复：使用printf构建提示词（安全处理括号等特殊字符）
           if [ "$CODE_EXISTS" == "true" ]; then
-            CODE='${{ steps.current.outputs.CODE }}'
-            PROMPT="基于以下代码优化：\n\n${CODE}\n\n要求：\n${INSTRUCTION}\n\n直接返回代码，不要解释。"
+            CODE=$(printf '%s' '${{ steps.current.outputs.CODE }}')
+            PROMPT=$(printf '基于以下代码优化：\n\n%s\n\n要求：\n%s\n\n直接返回代码，不要解释。' "$CODE" "$INSTRUCTION")
           else
-            PROMPT="根据要求生成代码：\n\n${INSTRUCTION}\n\n直接返回代码。"
+            PROMPT=$(printf '根据要求生成代码：\n\n%s\n\n直接返回代码。' "$INSTRUCTION")
           fi
           
-          # 使用jq安全构建JSON（避免手动拼接）
+          # ✅ 使用jq -n --arg安全传递变量（自动处理转义）
           PAYLOAD=$(jq -n \
             --arg prompt "$PROMPT" \
             --arg model "kimi-k2-0905-preview" \
@@ -106,7 +106,7 @@ jobs:
               "temperature": 0.3
             }')
           
-          # 调用API并保存完整响应
+          # 调用API并保存响应
           RESPONSE=$(curl -s -w "\n%{http_code}" https://api.moonshot.cn/v1/chat/completions \
             -H "Authorization: Bearer $KIMI_API_KEY" \
             -H "Content-Type: application/json" \
