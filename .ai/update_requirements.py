@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from pathlib import Path
+import argparse
 
 # Python标准库列表（用于过滤，避免将内置库加入requirements）
 STANDARD_LIBS = {
