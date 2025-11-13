@@ -1,0 +1,4 @@
+# AI工作流依赖（自动扫描生成）
+# 生成时间: 2025-11-13T13:59:29.718064
+# 可直接运行: pip install -r requirements-ai.txt
+
