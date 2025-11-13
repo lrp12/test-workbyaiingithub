@@ -1,134 +1,147 @@
 #!/usr/bin/env python3
 """
-自动扫描Python项目中的第三方依赖
-Kimi AI工作流专用
+智能依赖扫描脚本
+自动分析Python文件中的import语句，更新requirements-ai.txt
 """
-import ast
+
+import os
+import re
 import sys
 from pathlib import Path
-from typing import Set, List
-import subprocess
 
-# Python 3.11标准库列表（用于排除）
-STDLIB_MODULES = {
-    'abc', 'argparse', 'ast', 'asyncio', 'base64', 'bisect', 'builtins',
-    'collections', 'concurrent', 'configparser', 'contextlib', 'csv',
-    'dataclasses', 'datetime', 'decimal', 'dis', 'enum', 'fileinput',
-    'functools', 'glob', 'hashlib', 'heapq', 'hmac', 'html', 'http',
-    'importlib', 'inspect', 'io', 'itertools', 'json', 'logging',
-    'math', 'numbers', 'operator', 'os', 'pathlib', 'pickle', 'platform',
-    'pprint', 'queue', 'random', 're', 'secrets', 'socket', 'sqlite3',
-    'statistics', 'string', 'subprocess', 'sys', 'textwrap', 'threading',
-    'time', 'types', 'typing', 'urllib', 'uuid', 'warnings', 'weakref',
-    'xml', 'zipfile', 'zoneinfo'
+# Python标准库列表（用于过滤，避免将内置库加入requirements）
+STANDARD_LIBS = {
+    'os', 'sys', 'time', 'datetime', 'json', 're', 'math', 'random', 'string',
+    'pathlib', 'subprocess', 'threading', 'multiprocessing', 'collections',
+    'itertools', 'functools', 'typing', 'inspect', 'hashlib', 'base64',
+    'csv', 'io', 'pickle', 'sqlite3', 'uuid', 'warnings', 'logging',
+    'argparse', 'configparser', 'html', 'http', 'urllib', 'ftplib',
+    'smtplib', 'email', 'xml', 'zipfile', 'tarfile', 'gzip', 'bz2',
+    'lzma', 'shutil', 'tempfile', 'mimetypes', 'getpass', 'secrets',
+    'hmac', 'ssl', 'socket', 'select', 'asyncio', 'concurrent', 'ctypes',
+    'decimal', 'fractions', 'numbers', 'statistics', 'typing', 'enum',
+    'dataclasses', 'contextlib', 'dataclasses', 'enum', 'pprint',
+    'textwrap', 'stringprep', 'fnmatch', 'glob', 'linecache', 'traceback',
+    'cProfile', 'profile', 'pstats', 'timeit', 'trace', 'doctest'
 }
 
-def scan_imports(scan_path: str) -> Set[str]:
-    """扫描目录下所有Python文件的import语句"""
+# 常见第三方库及其推荐版本
+COMMON_PACKAGES = {
+    'requests': 'requests>=2.31.0',
+    'pytest': 'pytest==7.4.3',
+    'radon': 'radon==6.0.1',
+    'numpy': 'numpy>=1.24.0',
+    'pandas': 'pandas>=2.0.0',
+    'beautifulsoup4': 'beautifulsoup4>=4.12.0',
+    'lxml': 'lxml>=4.9.0',
+    'scrapy': 'scrapy>=2.9.0',
+    'selenium': 'selenium>=4.10.0',
+    'flask': 'flask>=2.3.0',
+    'django': 'django>=4.2.0',
+    'fastapi': 'fastapi>=0.100.0',
+    'pydantic': 'pydantic>=2.0.0',
+    'sqlalchemy': 'sqlalchemy>=2.0.0',
+}
+
+
+def extract_imports(file_path):
+    """从Python文件中提取所有import的库"""
     imports = set()
-    path = Path(scan_path)
     
-    for py_file in path.rglob("*.py"):
-        try:
-            with open(py_file, 'r', encoding='utf-8') as f:
-                tree = ast.parse(f.read(), str(py_file))
-            
-            for node in ast.walk(tree):
-                # import xxx
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        module = alias.name.split('.')[0]
-                        if module not in STDLIB_MODULES:
-                            imports.add(module)
-                
-                # from xxx import
-                elif isinstance(node, ast.FromImport):
-                    if node.module:
-                        module = node.module.split('.')[0]
-                        if module not in STDLIB_MODULES:
-                            imports.add(module)
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
         
-        except Exception:
-            # 跳过无法解析的文件
-            continue
+        # 匹配 import xxx
+        import_matches = re.findall(r'^\s*import\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*', content, re.MULTILINE)
+        imports.update(import_matches)
+        
+        # 匹配 from xxx import
+        from_matches = re.findall(r'^\s*from\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+import', content, re.MULTILINE)
+        imports.update(from_matches)
+        
+    except Exception as e:
+        print(f"⚠️  读取文件失败 {file_path}: {e}", file=sys.stderr)
     
     return imports
 
-def get_package_versions(packages: Set[str]) -> List[str]:
-    """获取包的版本信息"""
-    result = []
-    
-    for package in sorted(packages):
-        try:
-            # 尝试获取已安装版本
-            info = subprocess.run(
-                [sys.executable, '-m', 'pip', 'show', package],
-                capture_output=True,
-                text=True
-            )
-            
-            if info.returncode == 0:
-                # 解析pip show输出
-                for line in info.stdout.split('\n'):
-                    if line.startswith('Version:'):
-                        version = line.split(': ')[1]
-                        result.append(f"{package}=={version}")
-                        break
-            else:
-                # 如果未安装，只写包名（不推荐，会警告）
-                print(f"警告: {package} 未安装，无法锁定版本", file=sys.stderr)
-                result.append(f"{package}")
-        
-        except Exception as e:
-            print(f"获取 {package} 版本失败: {e}", file=sys.stderr)
-    
-    return result
 
-def update_requirements_file(output_path: str, packages: List[str]):
-    """更新requirements文件"""
-    path = Path(output_path)
+def scan_directory(scan_path):
+    """扫描目录下所有Python文件"""
+    all_imports = set()
+    python_files = list(Path(scan_path).rglob("*.py"))
     
-    # 读取现有文件（如果存在）
-    existing = set()
-    if path.exists():
-        with open(path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    existing.add(line.split('==')[0])
+    print(f"🔍 扫描Python文件: 找到 {len(python_files)} 个文件")
     
-    # 合并新发现的包
-    all_packages = set(packages)
+    for py_file in python_files:
+        # 跳过虚拟环境、缓存和隐藏目录
+        if any(skip in str(py_file) for skip in ['.git', '__pycache__', 'venv', '.venv', '.ai']):
+            continue
+        
+        imports = extract_imports(py_file)
+        if imports:
+            print(f"  📄 {py_file.relative_to(scan_path)}: {', '.join(imports)}")
+        all_imports.update(imports)
+    
+    return all_imports
+
+
+def filter_third_party(imports):
+    """过滤出第三方库"""
+    third_party = []
+    for imp in imports:
+        if imp not in STANDARD_LIBS and not imp.startswith('_'):
+            third_party.append(imp)
+    return sorted(third_party)
+
+
+def generate_requirements(third_party_libs, output_file):
+    """生成requirements文件"""
+    lines = ["# AI工作流依赖（自动生成）", "# 更新时间: " + __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'), ""]
+    
+    for lib in third_party_libs:
+        # 如果有预设版本，使用预设；否则只写库名
+        if lib in COMMON_PACKAGES:
+            lines.append(COMMON_PACKAGES[lib])
+        else:
+            lines.append(lib)
     
     # 写入文件
-    with open(path, 'w') as f:
-        f.write("# AI工作流依赖（自动扫描生成）\n")
-        f.write("# 生成时间: {}\n".format(__import__('datetime').datetime.now().isoformat()))
-        f.write("# 可直接运行: pip install -r {}\n\n".format(path.name))
-        
-        for pkg in sorted(all_packages):
-            f.write(f"{pkg}\n")
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
     
-    print(f"✅ 已更新: {path} ({len(all_packages)} 个包)")
+    print(f"\n✅ 依赖文件已更新: {output_file}")
+    print(f"📦 检测到 {len(third_party_libs)} 个第三方库:")
+    for lib in third_party_libs:
+        print(f"   - {lib}")
+
 
 def main():
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='自动扫描Python依赖')
-    parser.add_argument('--scan-path', default='.', help='扫描目录路径')
-    parser.add_argument('--output', default='requirements-ai.txt', help='输出文件路径')
+    parser = argparse.ArgumentParser(description='智能扫描Python依赖')
+    parser.add_argument('--scan-path', required=True, help='要扫描的目录路径')
+    parser.add_argument('--output', required=True, help='输出的requirements文件路径')
     args = parser.parse_args()
     
-    # 扫描import
-    print(f"正在扫描: {args.scan_path}")
-    imports = scan_imports(args.scan_path)
-    print(f"发现第三方库: {imports}")
+    if not os.path.isdir(args.scan_path):
+        print(f"❌ 错误: 扫描路径不存在 - {args.scan_path}", file=sys.stderr)
+        sys.exit(1)
     
-    # 获取版本
-    versioned = get_package_versions(imports)
+    print(f"📂 开始扫描目录: {args.scan_path}")
     
-    # 更新文件
-    update_requirements_file(args.output, versioned)
+    # 1. 扫描所有import
+    all_imports = scan_directory(args.scan_path)
+    print(f"\n📊 总计发现 {len(all_imports)} 个不同的 import")
+    
+    # 2. 过滤第三方库
+    third_party = filter_third_party(all_imports)
+    
+    if not third_party:
+        print("⚠️  未检测到需要的外部依赖")
+        return
+    
+    # 3. 生成requirements文件
+    generate_requirements(third_party, args.output)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
