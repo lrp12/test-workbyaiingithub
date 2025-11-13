@@ -72,11 +72,11 @@ jobs:
             PROMPT="根据要求生成代码：\n\n${{ steps.parse.outputs.INSTRUCTION }}\n\n直接返回代码。"
           fi
           
-          RESPONSE=$(curl -s https://api.moonshot.cn/v1/chat/completions \
+          RESPONSE=$(curl -s https://api.moonshot.cn/v1 \
             -H "Authorization: Bearer $KIMI_API_KEY" \
             -H "Content-Type: application/json" \
             -d "{
-              \"model\": \"moonshot-v1-8k\",
+              \"model\": \"kimi-k2-0905-preview\",
               \"messages\": [
                 {\"role\": \"system\", \"content\": \"你是资深代码专家，返回纯代码，不要markdown标记。\"},
                 {\"role\": \"user\", \"content\": \"$PROMPT\"}
