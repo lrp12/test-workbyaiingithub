@@ -1,9 +1,9 @@
 name: 🤖 Kimi AI迭代增强（修改+新增）
 
 # ==========================================
-# 触发机制：仅在PR评论中触发，Issue评论不触发
+# 触发机制：监听PR和Issue的创建评论事件
+# 注意：PR在GitHub中是一种特殊的Issue，所以使用issue_comment即可覆盖
 # 命令格式：@kimi-bot revise [i:目标文件] 修改要求
-# 示例：@kimi-bot revise i:src/*.py 添加日志功能
 # ==========================================
 on:
   issue_comment:
@@ -12,7 +12,7 @@ on:
 jobs:
   ai-revise:
     # 触发条件：评论包含@kimi-bot revise
-    # 注意：实际执行时会检查是否为PR（见Step 2）
+    # 注意：实际PR判断在Step 2中通过if条件控制
     if: contains(github.event.comment.body, '@kimi-bot revise')
     runs-on: ubuntu-latest
     
@@ -24,18 +24,17 @@ jobs:
     steps:
       # ==========================================
       # Step 1: 检出代码
-      # 关键修复：在PR中触发时，必须检出PR的源分支
-      # 否则默认检出主分支，导致无法修改文件
+      # 关键修复：在PR评论中触发时，github.head_ref自动指向PR源分支
+      # 无需复杂表达式，直接检出即可
       # ==========================================
       - uses: actions/checkout@v4
         with:
-          # 判断是否为PR，是则检出PR分支，否则检出当前分支
           ref: ${{ github.head_ref }}
       
       # ==========================================
       # Step 2: 获取PR上下文
       # 作用：获取PR中所有已存在的文件列表，作为AI修改基础
-      # 注意：仅在PR中执行，普通Issue中跳过（由if控制）
+      # 条件：仅在PR中执行（if: github.event.issue.pull_request）
       # 修复：使用core.setOutput()传递数据，避免JS模板字符串冲突
       # ==========================================
       - name: 获取PR文件列表
@@ -44,7 +43,7 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // 使用context获取PR编号，避免${{ }}注入
+            // 使用context获取PR编号，避免${{ }}注入导致语法错误
             const prNumber = context.issue.number;
             console.log(`正在获取PR #${prNumber} 信息...`);
             
@@ -476,7 +475,7 @@ jobs:
           commit_message: "feat: Kimi迭代增强 #${{ steps.pr_context.outputs.pr_number }}"
           
           # ✅ 修复：使用github.head_ref获取PR源分支
-          # 不需要从steps.pr_context.outputs.head_ref读取
+          # 无需复杂表达式，GitHub自动提供
           branch: ${{ github.head_ref }}
           
           # 提交所有文件（包括无扩展名的文件）
