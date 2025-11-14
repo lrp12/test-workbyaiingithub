@@ -1,219 +1,161 @@
-name: 🤖 Kimi AI修订
+name: 🤖 Kimi AI全自动优化（多文件支持）
 
 on:
   issue_comment:
     types: [created]
 
 jobs:
-  ai-revise:
-    if: contains(github.event.comment.body, '@kimi-bot revise') && github.event.issue.pull_request
+  ai-optimize:
+    if: contains(github.event.comment.body, '@kimi-bot optimize') && !github.event.issue.pull_request
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
+      issues: read
     
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.issue.pull_request.head.ref }}
       
-      - name: 确保依赖文件存在
-        run: |
-          if [ ! -f "requirements-ai.txt" ]; then
-            echo "# AI工作流依赖（自动生成）" > requirements-ai.txt
-            echo "# 占位文件，将被自动扫描更新" >> requirements-ai.txt
-            echo "pytest==7.4.3" >> requirements-ai.txt
-            echo "radon==6.0.1" >> requirements-ai.txt
-          fi
-      
-      - name: 设置Python环境并启用缓存
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: requirements-ai.txt
-      
-      - name: 安装依赖
-        run: pip install --upgrade pip && pip install -r requirements-ai.txt
-      
-      # ✅ **缺失的关键步骤：获取完整上下文**
-      - name: 获取完整上下文（Issue原始需求 + PR评论历史）
-        id: context
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const pr = context.payload.issue;
-            const prNumber = pr.number;
-            
-            // 1. 从PR描述中提取原始Issue上下文
-            let originalContext = '';
-            const prBody = pr.body || '';
-            const contextMatch = prBody.match(/<!-- ORIGINAL_ISSUE_CONTEXT([\s\S]*?)-->/);
-            if (contextMatch) {
-              const contextLines = contextMatch[1].trim().split('\n');
-              const contextObj = {};
-              contextLines.forEach(line => {
-                const [key, ...valueParts] = line.split(':');
-                if (key && valueParts.length > 0) {
-                  contextObj[key.trim()] = valueParts.join(':').trim();
-                }
-              });
-              originalContext = `## 原始Issue需求\n- Issue编号: #${contextObj.ISSUE_NUMBER || 'N/A'}\n- Issue标题: ${contextObj.ISSUE_TITLE || 'N/A'}\n- 原始指令: ${contextObj.ORIGINAL_COMMENT || 'N/A'}\n- 目标文件: ${contextObj.TARGET || 'N/A'}\n\n`;
-            }
-            
-            // 2. 获取所有PR评论历史（除当前评论）
-            let commentHistory = '';
-            try {
-              const comments = await github.rest.issues.listComments({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-              });
-              
-              const reviseComments = comments.data.filter(c => 
-                c.body.includes('@kimi-bot revise') && c.id !== context.payload.comment.id
-              );
-              
-              if (reviseComments.length > 0) {
-                commentHistory = '## 历史修订记录\n';
-                reviseComments.forEach((c, idx) => {
-                  const shortBody = c.body.length > 200 ? c.body.substring(0, 200) + '...' : c.body;
-                  commentHistory += `${idx + 1}. **@${c.user.login}** (${new Date(c.created_at).toLocaleString()}):\n   ${shortBody}\n\n`;
-                });
-              }
-            } catch (e) {
-              console.log('⚠️  获取评论历史失败:', e.message);
-            }
-            
-            // 3. 当前触发评论
-            const currentComment = context.payload.comment.body;
-            
-            // 4. 构建完整上下文
-            const fullContext = originalContext + commentHistory + '## 当前修订指令\n' + currentComment;
-            
-            // 5. 提取核心指令（移除@kimi-bot revise）
-            const coreInstruction = currentComment
-              .replace(/@kimi-bot revise/gi, '')
-              .replace(/```/g, '')
-              .replace(/文件[:：]\s*\S+/g, '')
-              .replace(/文件夹[:：]\s*\S+/g, '')
-              .replace(/目标[:：]\s*\S+/g, '')
-              .trim();
-            
-            // 输出到环境变量
-            fs.writeFileSync(process.env.GITHUB_OUTPUT, 
-              `FULL_CONTEXT_B64=${Buffer.from(fullContext).toString('base64')}\n` +
-              `CORE_INSTRUCTION_B64=${Buffer.from(coreInstruction).toString('base64')}\n` +
-              `PR_NUMBER=${prNumber}\n`
-            );
-      
-      - name: 解析SOURCE和TARGET（支持任意文件类型）
+      - name: 解析多文件输入和输出
         id: parse
         run: |
           FULL_COMMENT="${{ github.event.comment.body }}"
-          echo "📝 完整评论: $FULL_COMMENT"
+          echo "📝 原始指令: $FULL_COMMENT"
           
-          CLEAN_COMMENT=$(echo "$FULL_COMMENT" | sed 's/@kimi-bot revise//gi' | sed 's/```//g')
+          CLEAN_COMMENT=$(echo "$FULL_COMMENT" | sed 's/@kimi-bot optimize//gi' | sed 's/```//g')
           
-          # ✅ 提取SOURCE（读取分析的来源）
-          SOURCE_FILE=$(echo "$CLEAN_COMMENT" | grep -oP '文件[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
-          SOURCE_FOLDER=$(echo "$CLEAN_COMMENT" | grep -oP '文件夹[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
+          # ✅ 解析所有输入路径（逗号分隔）
+          INPUT_RAW=$(echo "$CLEAN_COMMENT" | grep -oP 'i[:：]\s*\K[^ ]+' | head -1)
+          if [ -z "$INPUT_RAW" ]; then
+            echo "❌ 必须指定输入路径，例如: i:src/main.py 或 i:src/*.py"
+            exit 1
+          fi
           
-          # ✅ 提取TARGET（写入目标）
-          WRITE_TARGET=$(echo "$CLEAN_COMMENT" | grep -oP '目标[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
-          
-          # 确定READ_TARGET（实际读取的内容）
-          if [ -n "$SOURCE_FILE" ]; then
-            if [ ! -f "$SOURCE_FILE" ]; then
-              echo "❌ 源文件不存在: $SOURCE_FILE"
-              exit 1
-            fi
-            echo "READ_TARGET=$SOURCE_FILE" >> "$GITHUB_OUTPUT"
-            echo "SOURCE_TYPE=file" >> "$GITHUB_OUTPUT"
-            echo "📄 源文件: $SOURCE_FILE"
-          elif [ -n "$SOURCE_FOLDER" ]; then
-            if [ ! -d "$SOURCE_FOLDER" ]; then
-              echo "❌ 源文件夹不存在: $SOURCE_FOLDER"
-              exit 1
-            fi
-            # ✅ 不再硬编码查找.py文件，直接传递文件夹路径
-            echo "READ_TARGET=$SOURCE_FOLDER" >> "$GITHUB_OUTPUT"
-            echo "SOURCE_TYPE=folder" >> "$GITHUB_OUTPUT"
-            echo "📁 源文件夹: $SOURCE_FOLDER"
-          else
-            # ✅ 优先级3: 从PR描述中获取目标
-            PR_BODY="${{ github.event.issue.body }}"
-            TARGET_IN_PR=$(echo "$PR_BODY" | grep -oP '目标[:：]\s*\K[^\s]+' | head -1)
-            if [ -n "$TARGET_IN_PR" ] && [ -f "$TARGET_IN_PR" ]; then
-              echo "READ_TARGET=$TARGET_IN_PR" >> "$GITHUB_OUTPUT"
-              echo "SOURCE_TYPE=file" >> "$GITHUB_OUTPUT"
-              echo "检测模式: PR描述中的目标文件" >> /dev/stderr
+          # ✅ 展开通配符并收集所有文件
+          ALL_FILES=""
+          IFS=',' read -ra INPUT_PATHS <<< "$INPUT_RAW"
+          for path in "${INPUT_PATHS[@]}"; do
+            # 移除路径两边的引号
+            path=$(echo "$path" | tr -d '"' | tr -d "'")
+            
+            if [[ "$path" == *"*"* ]]; then
+              # 通配符路径，使用find展开
+              MATCHED=$(find . -path "$path" -type f 2>/dev/null || echo "")
+              ALL_FILES="$ALL_FILES"$'\n'"$MATCHED"
+            elif [ -f "$path" ]; then
+              # 单个文件
+              ALL_FILES="$ALL_FILES"$'\n'"$path"
+            elif [ -d "$path" ]; then
+              # 目录，查找所有py文件
+              MATCHED=$(find "$path" -name "*.py" -type f 2>/dev/null || echo "")
+              ALL_FILES="$ALL_FILES"$'\n'"$MATCHED"
             else
-              echo "❌ 必须指定源文件或源文件夹"
-              echo "   示例: @kimi-bot revise 文件:src/main.py ..."
-              exit 1
+              echo "⚠️  警告: 路径不存在或无法识别: $path"
             fi
+          done
+          
+          # ✅ 去重并限制数量
+          UNIQUE_FILES=$(echo "$ALL_FILES" | grep -v '^$' | sort | uniq)
+          FILE_COUNT=$(echo "$UNIQUE_FILES" | wc -l)
+          
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "❌ 未找到任何有效文件"
+            exit 1
           fi
           
-          # ✅ 确定WRITE_TARGET（写入目标文件）
-          if [ -n "$WRITE_TARGET" ]; then
-            echo "WRITE_TARGET=$WRITE_TARGET" >> "$GITHUB_OUTPUT"
-            echo "🎯 写入目标: $WRITE_TARGET"
+          if [ "$FILE_COUNT" -gt 10 ]; then
+            echo "⚠️  警告: 找到 $FILE_COUNT 个文件，最多处理10个，将处理前10个"
+            UNIQUE_FILES=$(echo "$UNIQUE_FILES" | head -10)
+            FILE_COUNT=10
+          fi
+          
+          echo "FILES_LIST<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$UNIQUE_FILES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "FILE_COUNT=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "✅ 将处理 $FILE_COUNT 个文件"
+          
+          # ✅ 解析输出路径（可选）
+          OUTPUT_PATH=$(echo "$CLEAN_COMMENT" | grep -oP 'o[:：]\s*\K[^ ]+' | head -1 | tr -d '`"'"'")
+          if [ -n "$OUTPUT_PATH" ]; then
+            echo "OUTPUT_PATH=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
+            echo "🎯 输出路径: $OUTPUT_PATH"
+            
+            # 判断输出类型
+            if [ -d "$OUTPUT_PATH" ] || [ "${OUTPUT_PATH: -1}" == "/" ]; then
+              echo "OUTPUT_MODE=multi" >> "$GITHUB_OUTPUT"  # 批量输出到目录
+            else
+              echo "OUTPUT_MODE=merge" >> "$GITHUB_OUTPUT"  # 合并输出到单文件
+            fi
           else
-            # 无显式目标，默认写入源文件
-            READ_TARGET="${{ steps.parse.outputs.READ_TARGET }}"
-            echo "WRITE_TARGET=$READ_TARGET" >> "$GITHUB_OUTPUT"
-            echo "🎯 写入目标: $READ_TARGET（默认=读取源）"
+            echo "OUTPUT_MODE=inline" >> "$GITHUB_OUTPUT"  # 原地修改
+            echo "🎯 输出模式: 原地修改"
           fi
           
-          # 提取核心指令（移除SOURCE和TARGET定义）
-          CORE_INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed 's/文件[:：]\s*\S\+//g' | sed 's/文件夹[:：]\s*\S\+//g' | sed 's/目标[:：]\s*\S\+//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          # 提取核心指令
+          CORE_INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed 's/i[:：]\s*[^ ]\+//g' | sed 's/o[:：]\s*[^ ]\+//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           echo "CORE_INSTRUCTION_B64=$(echo "$CORE_INSTRUCTION" | base64 -w0)" >> "$GITHUB_OUTPUT"
           echo "💡 核心指令: '$CORE_INSTRUCTION'"
       
-      - name: 读取当前代码或目录信息
+      - name: 读取所有文件内容
         id: current
         run: |
-          READ_TARGET="${{ steps.parse.outputs.READ_TARGET }}"
-          SOURCE_TYPE="${{ steps.parse.outputs.SOURCE_TYPE }}"
+          FILES_LIST='${{ steps.parse.outputs.FILES_LIST }}'
+          FILE_COUNT='${{ steps.parse.outputs.FILE_COUNT }}'
           
-          if [ "$SOURCE_TYPE" == "file" ]; then
-            if [ ! -f "$READ_TARGET" ]; then
-              echo "❌ 读取目标文件不存在: $READ_TARGET"
-              exit 1
-            fi
-            CODE_B64=$(base64 -w0 < "$READ_TARGET")
-            echo "CODE_B64=$CODE_B64" >> "$GITHUB_OUTPUT"
-            echo "✅ 成功读取文件: $READ_TARGET ($(wc -c < "$READ_TARGET") 字节)"
-          else
-            # 文件夹模式：获取目录结构和文件列表
-            if [ ! -d "$READ_TARGET" ]; then
-              echo "❌ 读取目标文件夹不存在: $READ_TARGET"
-              exit 1
-            fi
-            # 生成目录树和文件清单
-            FILE_LIST=$(find "$READ_TARGET" -type f -not -path "*/\.*" | head -50)
-            DIR_TREE=$(tree "$READ_TARGET" -I '__pycache__|*.pyc|venv|.venv|.git' || find "$READ_TARGET" -maxdepth 2 -not -path "*/\.*")
+          # ✅ 构建多文件JSON结构
+          echo "FILES_JSON<<EOF" >> "$GITHUB_OUTPUT"
+          echo "[" >> "$GITHUB_OUTPUT"
+          
+          FIRST=true
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
             
-            echo "DIR_INFO_B64=$(echo -e "目录结构:\n$DIR_TREE\n\n文件清单:\n$FILE_LIST" | base64 -w0)" >> "$GITHUB_OUTPUT"
-            echo "✅ 成功读取文件夹信息: $READ_TARGET"
-          fi
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              echo "," >> "$GITHUB_OUTPUT"
+            fi
+            
+            CODE_B64=$(base64 -w0 < "$file" 2>/dev/null || echo "")
+            CODE_LEN=$(wc -c < "$file" 2>/dev/null || echo "0")
+            
+            cat >> "$GITHUB_OUTPUT" <<ITEM
+            {
+              "path": "$file",
+              "size": $CODE_LEN,
+              "content_b64": "$CODE_B64"
+            }
+ITEM
+          done <<< "$FILES_LIST"
+          
+          echo "]" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "✅ 成功读取 $FILE_COUNT 个文件"
       
-      - name: Kimi生成修订代码（基于完整上下文）
+      - name: Kimi批量生成优化代码
         id: ai
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
         run: |
-          SOURCE_TYPE="${{ steps.parse.outputs.SOURCE_TYPE }}"
-          FULL_CONTEXT=$(printf '%s' '${{ steps.context.outputs.FULL_CONTEXT_B64 }}' | base64 -d)
-          CORE_INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.CORE_INSTRUCTION_B64 }}' | base64 -d)
+          FILES_JSON=$(cat <<'EOF'
+          ${{ steps.current.outputs.FILES_JSON }}
+          EOF
+          )
           
-          if [ "$SOURCE_TYPE" == "file" ]; then
-            CODE=$(printf '%s' '${{ steps.current.outputs.CODE_B64 }}' | base64 -d)
-            PROMPT=$(printf '## 代码修订任务\n\n%s\n\n### 待修订代码\n```\n%s\n```\n\n### 核心要求\n%s\n\n请根据上述完整上下文进行精准修订，直接返回完整的修订后内容，不要解释。' "$FULL_CONTEXT" "$CODE" "$CORE_INSTRUCTION")
+          CORE_INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.CORE_INSTRUCTION_B64 }}' | base64 -d)
+          OUTPUT_MODE="${{ steps.parse.outputs.OUTPUT_MODE }}"
+          
+          # ✅ 构建多文件Prompt
+          PROMPT=$(printf '你将处理 %d 个文件，按以下JSON格式提供内容：\n\n%s\n\n指令：\n%s\n\n' $(echo "$FILES_JSON" | jq 'length') "$FILES_JSON" "$CORE_INSTRUCTION")
+          
+          # ✅ 根据输出模式追加要求
+          if [ "$OUTPUT_MODE" == "inline" ]; then
+            PROMPT="$PROMPT 对每个文件进行优化，返回JSON格式： [{\"path\": \"文件路径\", \"content\": \"优化后内容\"}]"
+          elif [ "$OUTPUT_MODE" == "multi" ]; then
+            PROMPT="$PROMPT 批量处理所有文件，返回JSON格式： [{\"path\": \"输出路径\", \"content\": \"新内容\"}]"
           else
-            DIR_INFO=$(printf '%s' '${{ steps.current.outputs.DIR_INFO_B64 }}' | base64 -d)
-            PROMPT=$(printf '## 代码生成任务（基于文件夹）\n\n%s\n\n### 文件夹信息\n```\n%s\n```\n\n### 核心要求\n%s\n\n请根据上述完整上下文生成所需文件内容，直接返回完整内容，不要解释。' "$FULL_CONTEXT" "$DIR_INFO" "$CORE_INSTRUCTION")
+            PROMPT="$PROMPT 合并所有文件内容，生成单一输出文件，只返回内容不返回路径"
           fi
           
           PAYLOAD=$(jq -n \
@@ -222,7 +164,7 @@ jobs:
             '{
               "model": $model,
               "messages": [
-                {"role": "system", "content": "你是资深代码专家，严格遵循用户指令和完整上下文，返回纯内容，不要markdown标记。"},
+                {"role": "system", "content": "你是资深代码专家，严格遵循指令，返回纯内容，不要markdown标记。JSON输出必须合法。"},
                 {"role": "user", "content": $prompt}
               ],
               "temperature": 0.3
@@ -234,13 +176,12 @@ jobs:
             -d "$PAYLOAD")
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d'
           
           mkdir -p kimi
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-          PR_NUM=${{ steps.context.outputs.PR_NUMBER }}
-          RESPONSE_FILE="kimi/revise_response_${PR_NUM}_${TIMESTAMP}.json"
-          echo "$RESPONSE_BODY" > "$RESPONSE_FILE"
+          ISSUE_NUM=${{ github.event.issue.number }}
+          echo "$RESPONSE_BODY" > "kimi/response_${ISSUE_NUM}_${TIMESTAMP}.json"
           
           if [ "$HTTP_CODE" != "200" ]; then
             echo "❌ API调用失败，状态码: $HTTP_CODE"
@@ -248,128 +189,73 @@ jobs:
             exit 1
           fi
           
-          REVISED_CONTENT=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // empty' | sed '/^```/d')
-          echo "REVISED_CONTENT_B64=$(echo "$REVISED_CONTENT" | base64 -w0)" >> "$GITHUB_OUTPUT"
-          echo "✅ Kimi修订内容生成完成"
+          # ✅ 保存AI响应到输出
+          AI_RESPONSE=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // empty' | sed '/^```/d')
+          echo "AI_RESPONSE_B64=$(echo "$AI_RESPONSE" | base64 -w0)" >> "$GITHUB_OUTPUT"
+          echo "✅ Kimi批量处理完成"
       
-      - name: Kimi Review修订后的代码（基于完整上下文）
-        id: review
-        env:
-          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+      - name: 应用AI生成的内容
         run: |
-          SOURCE_TYPE="${{ steps.parse.outputs.SOURCE_TYPE }}"
+          AI_RESPONSE=$(printf '%s' '${{ steps.ai.outputs.AI_RESPONSE_B64 }}' | base64 -d)
+          OUTPUT_MODE="${{ steps.parse.outputs.OUTPUT_MODE }}"
+          OUTPUT_PATH="${{ steps.parse.outputs.OUTPUT_PATH }}"
           
-          if [ "$SOURCE_TYPE" == "file" ]; then
-            CODE=$(printf '%s' '${{ steps.current.outputs.CODE_B64 }}' | base64 -d)
-            REVISED_CONTENT=$(printf '%s' '${{ steps.ai.outputs.REVISED_CONTENT_B64 }}' | base64 -d)
+          if [ "$OUTPUT_MODE" == "inline" ]; then
+            # ✅ 原地修改：解析JSON并更新每个文件
+            echo "$AI_RESPONSE" | jq -c '.[]' | while read -r item; do
+              FILE_PATH=$(echo "$item" | jq -r '.path')
+              CONTENT=$(echo "$item" | jq -r '.content' | sed '/^```/d')
+              mkdir -p $(dirname "$FILE_PATH")
+              echo "$CONTENT" > "$FILE_PATH"
+              echo "✅ 更新: $FILE_PATH"
+            done
+          elif [ "$OUTPUT_MODE" == "multi" ]; then
+            # ✅ 批量输出到目录
+            echo "$AI_RESPONSE" | jq -c '.[]' | while read -r item; do
+              OUT_PATH=$(echo "$item" | jq -r '.path')
+              CONTENT=$(echo "$item" | jq -r '.content' | sed '/^```/d')
+              # 如果AI返回的是相对路径，则基于OUTPUT_PATH
+              if [[ "$OUT_PATH" != /* ]] && [ -n "$OUTPUT_PATH" ]; then
+                OUT_PATH="${OUTPUT_PATH%/}/$OUT_PATH"
+              fi
+              mkdir -p $(dirname "$OUT_PATH")
+              echo "$CONTENT" > "$OUT_PATH"
+              echo "✅ 生成: $OUT_PATH"
+            done
           else
-            # 文件夹模式：将目录信息作为"代码"
-            CODE=$(printf '%s' '${{ steps.current.outputs.DIR_INFO_B64 }}' | base64 -d)
-            REVISED_CONTENT=$(printf '%s' '${{ steps.ai.outputs.REVISED_CONTENT_B64 }}' | base64 -d)
-          fi
-          
-          FULL_CONTEXT=$(printf '%s' '${{ steps.context.outputs.FULL_CONTEXT_B64 }}' | base64 -d)
-          
-          # ✅ Review Prompt：对比原始和修订，结合完整上下文
-          REVIEW_PROMPT=$(printf '## 代码审查任务\n\n%s\n\n### 原始内容\n```\n%s\n```\n\n### 修订后内容\n```\n%s\n```\n\n请审查修订后的内容，重点关注：\n1. 是否完全符合历史和当前修订要求\n2. 是否存在语法/格式错误\n3. 是否有逻辑缺陷\n4. 是否引入安全风险\n5. 是否与原始需求冲突\n\n如果发现任何问题，请明确指出并提供修复建议。如果内容无误，请回复"审查通过"。' "$FULL_CONTEXT" "$CODE" "$REVISED_CONTENT")
-          
-          REVIEW_PAYLOAD=$(jq -n \
-            --arg prompt "$REVIEW_PROMPT" \
-            --arg model "kimi-k2-0905-preview" \
-            '{
-              "model": $model,
-              "messages": [
-                {"role": "system", "content": "你是资深代码审查专家，严格审查内容质量。结合完整上下文，发现潜在问题。发现任何问题请明确指出，提供具体建议。"},
-                {"role": "user", "content": $prompt}
-              ],
-              "temperature": 0.2
-            }')
-          
-          REVIEW_RESPONSE=$(curl -s -w "\n%{http_code}" https://api.moonshot.cn/v1/chat/completions \
-            -H "Authorization: Bearer $KIMI_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "$REVIEW_PAYLOAD")
-          
-          REVIEW_HTTP_CODE=$(echo "$REVIEW_RESPONSE" | tail -1)
-          REVIEW_BODY=$(echo "$REVIEW_RESPONSE" | sed '$d')
-          
-          if [ "$REVIEW_HTTP_CODE" == "200" ]; then
-            REVIEW_RESULT=$(echo "$REVIEW_BODY" | jq -r '.choices[0].message.content // empty')
-            echo "REVIEW_RESULT_B64=$(echo "$REVIEW_RESULT" | base64 -w0)" >> "$GITHUB_OUTPUT"
-            
-            if echo "$REVIEW_RESULT" | grep -qi "审查通过"; then
-              echo "✅ 代码审查通过"
-            else
-              echo "⚠️  审查发现潜在问题:"
-              echo "$REVIEW_RESULT" | head -20
-            fi
-          else
-            echo "⚠️  Review API调用失败，状态码: $REVIEW_HTTP_CODE"
-            echo "⚠️  跳过审查步骤，继续执行"
-            echo "REVIEW_RESULT_B64=" >> "$GITHUB_OUTPUT"
+            # ✅ 合并输出到单文件
+            CONTENT=$(echo "$AI_RESPONSE" | sed '/^```/d')
+            mkdir -p $(dirname "$OUTPUT_PATH")
+            echo "$CONTENT" > "$OUTPUT_PATH"
+            echo "✅ 生成合并文件: $OUTPUT_PATH"
           fi
       
-      - name: 更新文件到WRITE_TARGET（支持任意类型）
-        run: |
-          WRITE_TARGET="${{ steps.parse.outputs.WRITE_TARGET }}"
-          mkdir -p $(dirname "$WRITE_TARGET")
-          printf '%s' '${{ steps.ai.outputs.REVISED_CONTENT_B64 }}' | base64 -d > "$WRITE_TARGET"
-          echo "✅ 文件已${{ steps.parse.outputs.WRITE_TARGET == steps.parse.outputs.READ_TARGET && '修订' || '生成' }}: $WRITE_TARGET"
-      
-      - name: 扫描并更新依赖
-        id: deps
-        run: |
-          python .ai/update_requirements.py --scan-path . --output requirements-ai.txt
-          if [ -n "$(git status --porcelain requirements-ai.txt)" ]; then
-            echo "DEP_UPDATED=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "DEP_UPDATED=false" >> "$GITHUB_OUTPUT"
-          fi
-      
-      - name: 提交修订到当前PR
-        run: |
-          git config --local user.email "actions@github.com"
-          git config --local user.name "GitHub Actions"
-          git add .
-          git commit -m "🤖 Kimi${{ steps.parse.outputs.WRITE_TARGET == steps.parse.outputs.READ_TARGET && '修订' || '生成' }}: ${{ steps.parse.outputs.WRITE_TARGET }} (${{ github.event.comment.id }})" || echo "无更改"
-          git push
-      
-      - name: 添加修订反馈评论（含完整上下文和Review报告）
-        uses: actions/github-script@v7
+      - name: 创建Pull Request（携带原始Issue上下文）
+        uses: peter-evans/create-pull-request@v6
         with:
-          script: |
-            const prNumber = context.issue.number;
-            const writeTarget = '${{ steps.parse.outputs.WRITE_TARGET }}';
-            const readTarget = '${{ steps.parse.outputs.READ_TARGET }}';
-            const depUpdated = '${{ steps.deps.outputs.DEP_UPDATED }}' === 'true';
-            const sourceType = '${{ steps.parse.outputs.SOURCE_TYPE }}';
-            const reviewResult = Buffer.from('${{ steps.review.outputs.REVIEW_RESULT_B64 }}', 'base64').toString('utf8');
-            const fullContext = Buffer.from('${{ steps.context.outputs.FULL_CONTEXT_B64 }}', 'base64').toString('utf8');
+          token: ${{ secrets.GITHUB_TOKEN }}
+          title: "🤖 Kimi优化: ${{ steps.parse.outputs.FILE_COUNT }}个文件"
+          body: |
+            ## Kimi AI批量优化结果
             
-            // 判断操作类型
-            const isGenerateMode = writeTarget !== readTarget;
-            const actionType = sourceType === 'folder' && isGenerateMode ? '生成' : 
-                              (writeTarget === readTarget ? '修订' : '转换');
+            **原始Issue**: #${{ github.event.issue.number }}
+            **触发指令**: ${{ github.event.comment.body }}
+            **处理文件数**: ${{ steps.parse.outputs.FILE_COUNT }}个
+            **输出模式**: ${{ steps.parse.outputs.OUTPUT_MODE }}
             
-            // 构建Review报告
-            let reviewSection = '';
-            if (reviewResult && reviewResult.trim()) {
-              if (reviewResult.includes('审查通过')) {
-                reviewSection = '\n\n## ✅ AI审查报告\n**审查结果**: 内容质量检查通过，未发现明显问题。';
-              } else {
-                reviewSection = `\n\n## ⚠️ AI审查报告\n**审查发现以下潜在问题**：\n\`\`\`\n${reviewResult}\n\`\`\`\n\n请开发者仔细核对上述问题，必要时进行人工调整。`;
-              }
-            }
+            ---            
+            1. 点击 [Files changed](https://github.com/${{ github.repository }}/pull/${{ github.event.issue.number }}/files) 查看代码
+            2. 如需调整，在本PR下评论 `@kimi-bot revise i:文件路径 新要求`
+            3. 满意后点 "Merge pull request"
             
-            // 构建完整上下文摘要（可折叠）
-            const contextSummary = `\n\n<details>\n<summary>📋 完整对话上下文</summary>\n\n${fullContext}\n</details>`;
-            
-            const depInfo = depUpdated ? '\n**依赖更新**: requirements-ai.txt 已自动更新' : '';
-            const body = `## 🤖 Kimi${actionType}完成\n\n**源路径**: \`${readTarget}\`\n**${actionType}文件**: \`${writeTarget}\`${depInfo}${reviewSection}${contextSummary}\n\n---\n✅ 操作已完成并提交到本PR分支。`;
-            
-            github.rest.issues.createComment({
-              issue_number: prNumber,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body
-            });
+            <!-- ORIGINAL_ISSUE_CONTEXT
+            ISSUE_NUMBER: ${{ github.event.issue.number }}
+            ISSUE_TITLE: ${{ github.event.issue.title }}
+            ORIGINAL_COMMENT: ${{ github.event.comment.body }}
+            TARGET: ${{ steps.parse.outputs.FILE_COUNT }}个文件
+            -->
+          branch: kimibot/optimize-${{ github.event.issue.number }}-${{ github.run_id }}
+          labels: kimi-optimized, automated
+          assignees: ${{ github.event.comment.user.login }}
+          commit-message: |
+            feat: Kimi批量优化 ${{ steps.parse.outputs.FILE_COUNT }}个文件
