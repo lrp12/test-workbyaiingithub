@@ -3,6 +3,10 @@ name: delete-merged-branch
 on:
   pull_request:
     types: [closed]
+    
+permissions:
+  contents: write
+    
 
 jobs:
   delete-branch:
