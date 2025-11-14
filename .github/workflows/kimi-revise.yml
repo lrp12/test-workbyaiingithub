@@ -1,0 +1,335 @@
+name: 🤖 Kimi AI修订
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  ai-revise:
+    if: contains(github.event.comment.body, '@kimi-bot revise') && github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.issue.pull_request.head.ref }}
+      
+      - name: 确保依赖文件存在
+        run: |
+          if [ ! -f "requirements-ai.txt" ]; then
+            echo "# AI工作流依赖（自动生成）" > requirements-ai.txt
+            echo "# 占位文件，将被自动扫描更新" >> requirements-ai.txt
+            echo "pytest==7.4.3" >> requirements-ai.txt
+            echo "radon==6.0.1" >> requirements-ai.txt
+          fi
+      
+      - name: 设置Python环境并启用缓存
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-ai.txt
+      
+      - name: 安装依赖
+        run: pip install --upgrade pip && pip install -r requirements-ai.txt
+      
+      - name: 获取完整上下文（Issue原始需求 + PR评论历史）
+        id: context
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.issue;
+            const prNumber = pr.number;
+            
+            // 1. 从PR描述中提取原始Issue上下文
+            let originalContext = '';
+            const prBody = pr.body || '';
+            const contextMatch = prBody.match(/<!-- ORIGINAL_ISSUE_CONTEXT([\s\S]*?)-->/);
+            if (contextMatch) {
+              const contextLines = contextMatch[1].trim().split('\n');
+              const contextObj = {};
+              contextLines.forEach(line => {
+                const [key, ...valueParts] = line.split(':');
+                if (key && valueParts.length > 0) {
+                  contextObj[key.trim()] = valueParts.join(':').trim();
+                }
+              });
+              originalContext = `## 原始Issue需求\n- Issue编号: #${contextObj.ISSUE_NUMBER || 'N/A'}\n- Issue标题: ${contextObj.ISSUE_TITLE || 'N/A'}\n- 原始指令: ${contextObj.ORIGINAL_COMMENT || 'N/A'}\n- 目标文件: ${contextObj.TARGET || 'N/A'}\n\n`;
+            }
+            
+            // 2. 获取所有PR评论历史
+            let commentHistory = '';
+            try {
+              const comments = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+              });
+              
+              const reviseComments = comments.data.filter(c => 
+                c.body.includes('@kimi-bot revise') && c.id !== context.payload.comment.id
+              );
+              
+              if (reviseComments.length > 0) {
+                commentHistory = '## 历史修订记录\n';
+                reviseComments.forEach((c, idx) => {
+                  const shortBody = c.body.length > 200 ? c.body.substring(0, 200) + '...' : c.body;
+                  commentHistory += `${idx + 1}. **@${c.user.login}** (${new Date(c.created_at).toLocaleString()}):\n   ${shortBody}\n\n`;
+                });
+              }
+            } catch (e) {
+              console.log('⚠️  获取评论历史失败:', e.message);
+            }
+            
+            // 3. 当前触发评论
+            const currentComment = context.payload.comment.body;
+            
+            // 4. 构建完整上下文
+            const fullContext = originalContext + commentHistory + '## 当前修订指令\n' + currentComment;
+            
+            // 5. 提取核心指令（移除@kimi-bot revise）
+            const coreInstruction = currentComment
+              .replace(/@kimi-bot revise/gi, '')
+              .replace(/```/g, '')
+              .replace(/文件[:：]\s*\S+/g, '')
+              .replace(/文件夹[:：]\s*\S+/g, '')
+              .trim();
+            
+            // 输出到环境变量
+            fs.writeFileSync(process.env.GITHUB_OUTPUT, 
+              `FULL_CONTEXT_B64=${Buffer.from(fullContext).toString('base64')}\n` +
+              `CORE_INSTRUCTION_B64=${Buffer.from(coreInstruction).toString('base64')}\n` +
+              `PR_NUMBER=${prNumber}\n`
+            );
+      
+      - name: 解析目标文件
+        id: parse
+        run: |
+          CLEAN_COMMENT=$(echo "${{ github.event.comment.body }}" | sed 's/@kimi-bot revise//gi' | sed 's/```//g')
+          
+          # 优先级1: 用户指定文件
+          USER_FILE=$(echo "$CLEAN_COMMENT" | grep -oP '文件[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
+          if [ -n "$USER_FILE" ]; then
+            if [ -f "$USER_FILE" ]; then
+              echo "TARGET_FILE=$USER_FILE" >> "$GITHUB_OUTPUT"
+              echo "检测模式: 用户指定文件" >> /dev/stderr
+            else
+              echo "❌ 指定的文件不存在: $USER_FILE"
+              exit 1
+            fi
+          fi
+          
+          # 优先级2: 用户指定文件夹
+          USER_FOLDER=$(echo "$CLEAN_COMMENT" | grep -oP '文件夹[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
+          if [ -n "$USER_FOLDER" ]; then
+            if [ ! -d "$USER_FOLDER" ]; then
+              echo "❌ 指定的文件夹不存在: $USER_FOLDER"
+              exit 1
+            fi
+            FIRST_PY=$(find "$USER_FOLDER" -name "*.py" -type f -not -path "*/\.*" | head -1)
+            if [ -n "$FIRST_PY" ]; then
+              echo "TARGET_FILE=$FIRST_PY" >> "$GITHUB_OUTPUT"
+              echo "检测模式: 用户指定文件夹" >> /dev/stderr
+            else
+              echo "❌ 文件夹中未找到Python文件: $USER_FOLDER"
+              exit 1
+            fi
+          fi
+          
+          # 优先级3: PR描述中的目标文件
+          if [ -z "${{ steps.parse.outputs.TARGET_FILE }}" ]; then
+            PR_BODY="${{ github.event.issue.body }}"
+            TARGET_MATCH=$(echo "$PR_BODY" | grep -oP '目标[:：]\s*\K[^\s]+' | head -1)
+            if [ -n "$TARGET_MATCH" ] && [ -f "$TARGET_MATCH" ]; then
+              echo "TARGET_FILE=$TARGET_MATCH" >> "$GITHUB_OUTPUT"
+              echo "检测模式: PR描述" >> /dev/stderr
+            fi
+          fi
+          
+          TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
+          if [ -z "$TARGET_FILE" ]; then
+            echo "❌ 无法确定目标文件，请在指令中显式指定"
+            echo "   示例: @kimi-bot revise 文件:src/main.py 添加日志"
+            exit 1
+          fi
+          
+          echo "最终目标文件: $TARGET_FILE"
+          echo "TARGET_FILE=$TARGET_FILE" >> "$GITHUB_OUTPUT"
+      
+      - name: 读取当前代码
+        id: current
+        run: |
+          TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
+          
+          if [ -z "$TARGET_FILE" ]; then
+            echo "❌ 致命错误: TARGET_FILE为空"
+            exit 1
+          fi
+          
+          if [ ! -f "$TARGET_FILE" ]; then
+            echo "❌ 文件不存在: $TARGET_FILE"
+            echo "当前目录结构:"
+            find . -name "*.py" -type f -not -path "./.*" -not -path "./venv/*" -not -path "./.venv/*" -not -path "./kimi/*" | head -20
+            exit 1
+          fi
+          
+          CODE_B64=$(base64 -w0 < "$TARGET_FILE")
+          echo "CODE_B64=$CODE_B64" >> "$GITHUB_OUTPUT"
+          echo "✅ 成功读取文件: $TARGET_FILE ($(wc -c < "$TARGET_FILE") 字节)"
+      
+      - name: Kimi生成修订代码（基于完整上下文）
+        id: ai
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+        run: |
+          CODE=$(printf '%s' '${{ steps.current.outputs.CODE_B64 }}' | base64 -d)
+          FULL_CONTEXT=$(printf '%s' '${{ steps.context.outputs.FULL_CONTEXT_B64 }}' | base64 -d)
+          CORE_INSTRUCTION=$(printf '%s' '${{ steps.context.outputs.CORE_INSTRUCTION_B64 }}' | base64 -d)
+          
+          # ✅ 终极Prompt：包含完整对话历史 + 当前指令
+          PROMPT=$(printf '## 代码修订任务\n\n%s\n\n### 待修订代码\n```python\n%s\n```\n\n### 核心要求\n%s\n\n请根据上述上下文进行精准修订，直接返回完整的修订后代码，不要解释。' "$FULL_CONTEXT" "$CODE" "$CORE_INSTRUCTION")
+          
+          PAYLOAD=$(jq -n \
+            --arg prompt "$PROMPT" \
+            --arg model "kimi-k2-0905-preview" \
+            '{
+              "model": $model,
+              "messages": [
+                {"role": "system", "content": "你是资深代码专家，严格遵循用户指令修改代码，返回纯代码，不要markdown标记。"},
+                {"role": "user", "content": $prompt}
+              ],
+              "temperature": 0.3
+            }')
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.moonshot.cn/v1/chat/completions \
+            -H "Authorization: Bearer $KIMI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          mkdir -p kimi
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          PR_NUM=${{ steps.context.outputs.PR_NUMBER }}
+          RESPONSE_FILE="kimi/revise_response_${PR_NUM}_${TIMESTAMP}.json"
+          echo "$RESPONSE_BODY" > "$RESPONSE_FILE"
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ API调用失败，状态码: $HTTP_CODE"
+            echo "响应内容: $RESPONSE_BODY"
+            exit 1
+          fi
+          
+          REVISED_CODE=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // empty' | sed '/^```/d')
+          echo "REVISED_CODE_B64=$(echo "$REVISED_CODE" | base64 -w0)" >> "$GITHUB_OUTPUT"
+          echo "✅ Kimi修订代码生成完成"
+      
+      - name: Kimi Review修订后的代码（基于完整上下文）
+        id: review
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+        run: |
+          CODE=$(printf '%s' '${{ steps.current.outputs.CODE_B64 }}' | base64 -d)
+          REVISED_CODE=$(printf '%s' '${{ steps.ai.outputs.REVISED_CODE_B64 }}' | base64 -d)
+          FULL_CONTEXT=$(printf '%s' '${{ steps.context.outputs.FULL_CONTEXT_B64 }}' | base64 -d)
+          
+          # ✅ Review Prompt：对比原始和修订代码，结合完整上下文发现潜在问题
+          REVIEW_PROMPT=$(printf '## 代码审查任务\n\n%s\n\n### 原始代码\n```python\n%s\n```\n\n### 修订后代码\n```python\n%s\n```\n\n请审查修订后的代码，重点关注：\n1. 是否完全符合历史和当前修订要求\n2. 是否存在语法错误\n3. 是否有逻辑缺陷\n4. 是否引入安全风险\n5. 是否与原始需求冲突\n\n如果发现任何问题，请明确指出并提供修复建议。如果代码无误，请回复"审查通过"。' "$FULL_CONTEXT" "$CODE" "$REVISED_CODE")
+          
+          REVIEW_PAYLOAD=$(jq -n \
+            --arg prompt "$REVIEW_PROMPT" \
+            --arg model "kimi-k2-0905-preview" \
+            '{
+              "model": $model,
+              "messages": [
+                {"role": "system", "content": "你是资深代码审查专家，严格审查代码质量。结合完整上下文，发现潜在问题。发现任何问题请明确指出，提供具体行号和修复建议。"},
+                {"role": "user", "content": $prompt}
+              ],
+              "temperature": 0.2
+            }')
+          
+          REVIEW_RESPONSE=$(curl -s -w "\n%{http_code}" https://api.moonshot.cn/v1/chat/completions \
+            -H "Authorization: Bearer $KIMI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$REVIEW_PAYLOAD")
+          
+          REVIEW_HTTP_CODE=$(echo "$REVIEW_RESPONSE" | tail -1)
+          REVIEW_BODY=$(echo "$REVIEW_RESPONSE" | sed '$d')
+          
+          if [ "$REVIEW_HTTP_CODE" == "200" ]; then
+            REVIEW_RESULT=$(echo "$REVIEW_BODY" | jq -r '.choices[0].message.content // empty')
+            echo "REVIEW_RESULT_B64=$(echo "$REVIEW_RESULT" | base64 -w0)" >> "$GITHUB_OUTPUT"
+            
+            # 在日志中显示审查结果摘要
+            if echo "$REVIEW_RESULT" | grep -qi "审查通过"; then
+              echo "✅ 代码审查通过"
+            else
+              echo "⚠️  代码审查发现潜在问题:"
+              echo "$REVIEW_RESULT" | head -20
+            fi
+          else
+            echo "⚠️  Review API调用失败，状态码: $REVIEW_HTTP_CODE"
+            echo "⚠️  跳过审查步骤，继续执行"
+            echo "REVIEW_RESULT_B64=" >> "$GITHUB_OUTPUT"
+          fi
+      
+      - name: 更新文件
+        run: |
+          TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
+          printf '%s' '${{ steps.ai.outputs.REVISED_CODE_B64 }}' | base64 -d > "$TARGET_FILE"
+          echo "✅ 文件已更新: $TARGET_FILE"
+      
+      - name: 扫描并更新依赖
+        id: deps
+        run: |
+          python .ai/update_requirements.py --scan-path . --output requirements-ai.txt
+          if [ -n "$(git status --porcelain requirements-ai.txt)" ]; then
+            echo "DEP_UPDATED=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "DEP_UPDATED=false" >> "$GITHUB_OUTPUT"
+          fi
+      
+      - name: 提交修订到当前PR
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add .
+          git commit -m "🤖 Kimi修订: ${{ steps.parse.outputs.TARGET_FILE }} (${{ github.event.comment.id }})" || echo "无更改"
+          git push
+      
+      - name: 添加修订反馈评论（含完整上下文和Review报告）
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.issue.number;
+            const filePath = '${{ steps.parse.outputs.TARGET_FILE }}';
+            const depUpdated = '${{ steps.deps.outputs.DEP_UPDATED }}' === 'true';
+            const reviewResult = Buffer.from('${{ steps.review.outputs.REVIEW_RESULT_B64 }}', 'base64').toString('utf8');
+            const fullContext = Buffer.from('${{ steps.context.outputs.FULL_CONTEXT_B64 }}', 'base64').toString('utf8');
+            
+            // 构建Review报告部分
+            let reviewSection = '';
+            if (reviewResult && reviewResult.trim()) {
+              if (reviewResult.includes('审查通过')) {
+                reviewSection = '\n\n## ✅ 代码审查\n**审查结果**: 代码质量检查通过，未发现明显问题。';
+              } else {
+                reviewSection = `\n\n## ⚠️ 代码审查报告\n**审查发现以下问题**：\n\`\`\`\n${reviewResult}\n\`\`\`\n\n请开发者仔细核对上述问题，必要时进行人工调整。`;
+              }
+            }
+            
+            // 构建完整上下文摘要（可折叠）
+            const contextSummary = `\n\n<details>\n<summary>📋 完整对话上下文</summary>\n\n${fullContext}\n</details>`;
+            
+            const depInfo = depUpdated ? '\n**依赖更新**: requirements-ai.txt 已自动更新' : '';
+            const body = `## 🤖 Kimi修订完成\n\n**修订文件**: \`${filePath}\`${depInfo}${reviewSection}${contextSummary}\n\n---\n✅ 代码已更新并提交到本PR分支。`;
+            
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
