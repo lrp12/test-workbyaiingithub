@@ -1,5 +1,9 @@
-name: 🤖 Kimi AI迭代增强
+name: 🤖 Kimi AI迭代增强（修改+新增）
 
+# ==========================================
+# 触发机制：监听PR和Issue的创建评论事件
+# 命令格式：@kimi-bot revise [i:目标文件] 修改要求
+# ==========================================
 on:
   issue_comment:
     types: [created]
@@ -14,7 +18,8 @@ jobs:
     
     steps:
       # ==========================================
-      # Step 1: ✅ 修复：使用简单表达式
+      # Step 1: 检出PR分支
+      # github.head_ref 在PR评论中自动指向源分支
       # ==========================================
       - uses: actions/checkout@v4
         with:
@@ -22,6 +27,8 @@ jobs:
       
       # ==========================================
       # Step 2: 获取PR文件列表
+      # 通过GitHub API获取PR中所有已存在的文件
+      # 仅在PR中执行（if: github.event.issue.pull_request）
       # ==========================================
       - name: 获取PR文件列表
         id: pr_context
@@ -30,6 +37,8 @@ jobs:
         with:
           script: |
             const prNumber = context.issue.number;
+            console.log(`正在获取PR #${prNumber} 信息...`);
+            
             const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -51,12 +60,16 @@ jobs:
             console.log(`✅ 获取完成: ${files.data.length}个文件`);
       
       # ==========================================
-      # Step 3: 解析指令
+      # Step 3: 解析用户指令
+      # 提取目标文件和修改要求
+      # 支持格式：@kimi-bot revise i:src/*.py 添加日志
       # ==========================================
       - name: 解析修改指令
         id: parse
         run: |
           FULL_COMMENT='${{ github.event.comment.body }}'
+          echo "📝 原始指令: $FULL_COMMENT"
+          
           CLEAN_COMMENT=$(echo "$FULL_COMMENT" | sed 's/@kimi-bot revise//gi' | sed 's/```//g')
           
           TARGET_FILES=$(echo "$CLEAN_COMMENT" | grep -oP 'i[:：]\s*\K[^ ]+' | head -1)
@@ -69,9 +82,12 @@ jobs:
           REVISE_REQ=$(echo "$CLEAN_COMMENT" | sed 's/i[:：]\s*[^ ]\+//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           REVISE_REQ_B64=$(printf '%s' "$REVISE_REQ" | base64 -w0)
           echo "REVISE_REQ_B64=$REVISE_REQ_B64" >> "$GITHUB_OUTPUT"
+          echo "💡 修改要求: '$REVISE_REQ'"
       
       # ==========================================
-      # Step 4: ✅ 修复：使用printf构建JSON（避免jq循环）
+      # Step 4: ✅ 修复：使用临时文件避免here-document
+      # 读取目标文件内容，构建JSON数组
+      # 支持所有文件类型（不限于.py）
       # ==========================================
       - name: 读取当前文件
         id: current
@@ -79,7 +95,7 @@ jobs:
           TARGETS='${{ steps.parse.outputs.TARGET_FILES }}'
           echo "📂 正在读取目标文件: $TARGETS"
           
-          # 使用临时文件存储JSON，避免多行变量
+          # 创建临时JSON文件
           TEMP_JSON=$(mktemp)
           echo "[]" > "$TEMP_JSON"
           
@@ -103,14 +119,13 @@ jobs:
               CODE_B64=$(base64 -w0 < "$file" 2>/dev/null)
               CODE_LEN=$(wc -c < "$file" 2>/dev/null)
               
-              # 追加元素到JSON数组
+              # 追加到JSON数组
               jq --arg path "$file" --arg content "$CODE_B64" --argjson size "$CODE_LEN" \
                 '. += [{"path": $path, "size": $size, "content_b64": $content}]' \
                 "$TEMP_JSON" > "$TEMP_JSON.tmp" && mv "$TEMP_JSON.tmp" "$TEMP_JSON"
             done
           done
           
-          # 统计文件数量
           FILE_COUNT=$(jq 'length' "$TEMP_JSON")
           
           if [ "$FILE_COUNT" -eq 0 ]; then
@@ -124,7 +139,7 @@ jobs:
             FILE_COUNT=10
           fi
           
-          # 输出到GitHub Output
+          # ✅ 关键修复：使用cat输出，避免缩进问题
           echo "FILES_JSON<<EOF" >> "$GITHUB_OUTPUT"
           cat "$TEMP_JSON" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
@@ -133,7 +148,8 @@ jobs:
           echo "✅ 成功读取 $FILE_COUNT 个文件"
       
       # ==========================================
-      # Step 5: Kimi生成
+      # Step 5: 调用Kimi API生成响应
+      # 约束：优先修改，最多3个新文件
       # ==========================================
       - name: Kimi迭代增强
         id: ai
@@ -144,7 +160,7 @@ jobs:
           PR_FILES='${{ steps.pr_context.outputs.modified_files }}'
           REVISE_REQ=$(printf '%s' '${{ steps.parse.outputs.REVISE_REQ_B64 }}' | base64 -d)
           
-          # ✅ 修复：使用单行构建Prompt
+          # 构建Prompt
           PROMPT="PR文件: $PR_FILES\n目标文件: $FILES_JSON\n需求: $REVISE_REQ\n规则: 优先修改,最多3个新文件"
           
           PAYLOAD=$(jq -n \
@@ -193,7 +209,8 @@ jobs:
           echo "✅ Kimi处理完成，共 $FILE_COUNT 个文件"
       
       # ==========================================
-      # Step 6: 应用更改
+      # Step 6: ✅ 修复：移除内联文档，使用纯Shell
+      # 应用修改和创建文件，带备份机制
       # ==========================================
       - name: 应用修改和创建文件
         id: apply
@@ -204,6 +221,13 @@ jobs:
           CREATED_COUNT=0
           FAILED_COUNT=0
           
+          # 创建备份目录
+          BACKUP_DIR="kimi/backups/revise_${{ github.run_id }}"
+          mkdir -p "$BACKUP_DIR"
+          
+          echo "📂 开始应用更改..."
+          
+          # 使用进程替代避免子shell问题
           while IFS= read -r item; do
             set +e
             
@@ -214,35 +238,52 @@ jobs:
             CLEAN_PATH=$(echo "$FILE_PATH" | sed 's/^\.\///' | sed 's/^\///')
             FULL_PATH="./$CLEAN_PATH"
             
+            # 安全检测：创建文件前检查是否已存在
             if [ "$ACTION" == "create" ] && [ -f "$FULL_PATH" ]; then
-              echo "❌ 文件已存在: $FULL_PATH"
+              echo "❌ 安全拦截：尝试创建已存在的文件 $FULL_PATH"
               FAILED_COUNT=$((FAILED_COUNT + 1))
               continue
             fi
             
+            # 创建父目录
             mkdir -p "$(dirname "$FULL_PATH")"
+            
+            # 备份机制：修改前备份原文件
+            if [ "$ACTION" == "modify" ] && [ -f "$FULL_PATH" ]; then
+              BACKUP_PATH="${BACKUP_DIR}/${CLEAN_PATH}.backup"
+              mkdir -p "$(dirname "$BACKUP_PATH")"
+              cp "$FULL_PATH" "$BACKUP_PATH"
+              echo "💾 备份: $CLEAN_PATH"
+            fi
+            
+            # 写入文件
             printf '%s' "$CONTENT" > "$FULL_PATH"
             
             if [ $? -eq 0 ]; then
               if [ "$ACTION" == "create" ]; then
+                echo "✅ 创建: $FULL_PATH"
                 CREATED_COUNT=$((CREATED_COUNT + 1))
               else
+                echo "✅ 修改: $FULL_PATH"
                 MODIFIED_COUNT=$((MODIFIED_COUNT + 1))
               fi
             else
+              echo "❌ 写入失败: $FULL_PATH"
               FAILED_COUNT=$((FAILED_COUNT + 1))
             fi
             
             set -e
           done < <(echo "$AI_RESPONSE" | jq -c '.[]')
           
+          # 保存统计信息
           echo "MODIFIED_COUNT=$MODIFIED_COUNT" >> "$GITHUB_ENV"
           echo "CREATED_COUNT=$CREATED_COUNT" >> "$GITHUB_ENV"
           echo "FAILED_COUNT=$FAILED_COUNT" >> "$GITHUB_ENV"
           echo "🏁 应用完成：修改 $MODIFIED_COUNT 个，创建 $CREATED_COUNT 个，失败 $FAILED_COUNT 个"
       
       # ==========================================
-      # Step 7: ✅ 修复：使用env传递变量
+      # Step 7: ✅ 修复：通过env传递变量
+      # 更新PR描述，追加迭代报告
       # ==========================================
       - name: 更新PR描述
         uses: actions/github-script@v7
@@ -252,9 +293,14 @@ jobs:
             AI_RESPONSE_B64: ${{ steps.ai.outputs.AI_RESPONSE_B64 }}
             COMMENT_USER: ${{ github.event.comment.user.login }}
             COMMENT_BODY: ${{ github.event.comment.body }}
+            MODIFIED_COUNT: ${{ env.MODIFIED_COUNT }}
+            CREATED_COUNT: ${{ env.CREATED_COUNT }}
+            FAILED_COUNT: ${{ env.FAILED_COUNT }}
           script: |
             const prNumber = parseInt(process.env.PR_NUMBER);
-            const aiResponse = JSON.parse(Buffer.from(process.env.AI_RESPONSE_B64, 'base64').toString());
+            const aiResponse = JSON.parse(
+              Buffer.from(process.env.AI_RESPONSE_B64, 'base64').toString()
+            );
             
             const modifiedFiles = aiResponse.filter(f => f.action === 'modify').map(f => f.path);
             const createdFiles = aiResponse.filter(f => f.action === 'create').map(f => f.path);
@@ -265,14 +311,23 @@ jobs:
               pull_number: prNumber
             });
             
+            const timestamp = new Date().toLocaleString('zh-CN');
             const report = [
-              '## 🤖 Kimi迭代增强报告',
+              '## 🤖 Kimi迭代增强报告（' + timestamp + '）',
               '',
               '**触发**: @' + process.env.COMMENT_USER + ' - ' + process.env.COMMENT_BODY,
-              '**结果**: 修改 ' + modifiedFiles.length + ' 个，创建 ' + createdFiles.length + ' 个',
+              '**结果**: ✅ 修改 ' + process.env.MODIFIED_COUNT + ' 个，➕ 创建 ' + process.env.CREATED_COUNT + ' 个，❌ 失败 ' + process.env.FAILED_COUNT + ' 个',
               '',
-              '**修改**: ' + (modifiedFiles.length ? modifiedFiles.join(', ') : '无'),
-              '**新增**: ' + (createdFiles.length ? createdFiles.join(', ') : '无')
+              '---',
+              '',
+              '### 📝 修改的文件',
+              (modifiedFiles.length > 0 ? modifiedFiles.map(f => '- ' + f).join('\n') : '（无）'),
+              '',
+              '### ➕ 创建的新文件',
+              (createdFiles.length > 0 ? createdFiles.map(f => '- ' + f + ' ⚠️ 新').join('\n') : '（无）'),
+              '',
+              '---',
+              'ℹ️ 由 @' + process.env.COMMENT_USER + ' 通过 `@kimi-bot revise` 触发'
             ].join('\n');
             
             await github.rest.pulls.update({
@@ -283,12 +338,13 @@ jobs:
             });
       
       # ==========================================
-      # Step 8: ✅ 修复：简化提交步骤
+      # Step 8: 提交到PR分支
       # ==========================================
-      - name: 提交更改
+      - name: 提交更改到PR
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "feat: Kimi迭代增强 #${{ steps.pr_context.outputs.pr_number }}"
           branch: ${{ github.head_ref }}
           file_pattern: "*"
           commit_user_name: kimibot
+          commit_user_email: kimibot@github-actions.local
