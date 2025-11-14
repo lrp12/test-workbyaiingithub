@@ -1,0 +1,209 @@
+name: 🤖 Kimi AI全自动优化
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  ai-optimize:
+    if: contains(github.event.comment.body, '@kimi-bot optimize') && !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: read
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: 确保依赖文件存在
+        run: |
+          if [ ! -f "requirements-ai.txt" ]; then
+            echo "# AI工作流依赖（自动生成）" > requirements-ai.txt
+            echo "# 占位文件，将被自动扫描更新" >> requirements-ai.txt
+            echo "pytest==7.4.3" >> requirements-ai.txt
+            echo "radon==6.0.1" >> requirements-ai.txt
+          fi
+      
+      - name: 设置Python环境并启用缓存
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-ai.txt
+      
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-ai.txt
+      
+      - name: 解析优化指令（必须指定文件或文件夹）
+        id: parse
+        run: |
+          FULL_COMMENT="${{ github.event.comment.body }}"
+          echo "📝 原始Issue指令: $FULL_COMMENT"
+          
+          CLEAN_COMMENT=$(echo "$FULL_COMMENT" | sed 's/@kimi-bot optimize//gi' | sed 's/```//g')
+          INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed 's/\(文件\|文件夹\)[:：][^ ]*//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          
+          if echo "$CLEAN_COMMENT" | grep -qP '文件夹[:：]\s*\K[^\s]+'; then
+            FOLDER=$(echo "$CLEAN_COMMENT" | grep -oP '文件夹[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
+            FILES=$(find "$FOLDER" -name "*.py" -type f 2>/dev/null || echo "")
+            if [ -z "$FILES" ]; then
+              echo "❌ 文件夹不存在或无Python文件: $FOLDER"
+              exit 1
+            fi
+            echo "FILES_LIST<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$FILES" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "MODE=folder" >> "$GITHUB_OUTPUT"
+            echo "FOLDER_PATH=$FOLDER" >> "$GITHUB_OUTPUT"
+            echo "📁 批量处理文件夹: $FOLDER（共$(echo "$FILES" | wc -l)个文件）"
+          elif echo "$CLEAN_COMMENT" | grep -qP '文件[:：]\s*\K[^\s]+'; then
+            FILE_NAME=$(echo "$CLEAN_COMMENT" | grep -oP '文件[:：]\s*\K[^\s]+' | head -1 | tr -d '`')
+            if [ ! -f "$FILE_NAME" ]; then
+              echo "❌ 文件不存在: $FILE_NAME"
+              exit 1
+            fi
+            echo "TARGET_FILE=$FILE_NAME" >> "$GITHUB_OUTPUT"
+            echo "MODE=file" >> "$GITHUB_OUTPUT"
+            echo "📄 指定目标文件: $FILE_NAME"
+          else
+            echo "❌ 必须指定文件或文件夹，格式："
+            echo "   @kimi-bot optimize 文件:src/main.py 优化描述"
+            echo "   或"
+            echo "   @kimi-bot optimize 文件夹:src/ 优化描述"
+            exit 1
+          fi
+          
+          echo "ORIGINAL_INSTRUCTION_B64=$(echo "$INSTRUCTION" | base64 -w0)" >> "$GITHUB_OUTPUT"
+          echo "FULL_COMMENT_B64=$(echo "$FULL_COMMENT" | base64 -w0)" >> "$GITHUB_OUTPUT"
+      
+      - name: 读取待优化代码（支持批量）
+        id: current
+        run: |
+          MODE="${{ steps.parse.outputs.MODE }}"
+          
+          if [ "$MODE" == "folder" ]; then
+            FILES_LIST='${{ steps.parse.outputs.FILES_LIST }}'
+            echo "CODE_EXISTS=true" >> "$GITHUB_OUTPUT"
+            echo "FILES_LIST_B64=$(echo "$FILES_LIST" | base64 -w0)" >> "$GITHUB_OUTPUT"
+            echo "✅ 批量模式，准备处理 $(echo "$FILES_LIST" | wc -l) 个文件"
+          else
+            TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
+            CODE_B64=$(base64 -w0 < "$TARGET_FILE")
+            echo "CODE_EXISTS=true" >> "$GITHUB_OUTPUT"
+            echo "CODE_B64=$CODE_B64" >> "$GITHUB_OUTPUT"
+            echo "✅ 找到文件: $TARGET_FILE"
+          fi
+      
+      - name: Kimi生成优化代码
+        id: ai
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+        run: |
+          INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.ORIGINAL_INSTRUCTION_B64 }}' | base64 -d)
+          MODE="${{ steps.parse.outputs.MODE }}"
+          
+          if [ "$MODE" == "folder" ]; then
+            FILES_LIST=$(printf '%s' '${{ steps.current.outputs.FILES_LIST_B64 }}' | base64 -d)
+            FIRST_FILE=$(echo "$FILES_LIST" | head -1)
+            CODE=$(base64 -w0 < "$FIRST_FILE" | base64 -d)
+            PROMPT=$(printf '批量处理文件夹，优先优化此文件：\n\n%s\n\n要求：\n%s\n\n直接返回代码，不要解释。' "$CODE" "$INSTRUCTION")
+          else
+            TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
+            CODE=$(printf '%s' '${{ steps.current.outputs.CODE_B64 }}' | base64 -d)
+            PROMPT=$(printf '基于以下代码优化：\n\n%s\n\n要求：\n%s\n\n直接返回代码，不要解释。' "$CODE" "$INSTRUCTION")
+          fi
+          
+          PAYLOAD=$(jq -n \
+            --arg prompt "$PROMPT" \
+            --arg model "kimi-k2-0905-preview" \
+            '{
+              "model": $model,
+              "messages": [
+                {"role": "system", "content": "你是资深代码专家，返回纯代码，不要markdown标记。"},
+                {"role": "user", "content": $prompt}
+              ],
+              "temperature": 0.3
+            }')
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.moonshot.cn/v1/chat/completions \
+            -H "Authorization: Bearer $KIMI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          mkdir -p kimi
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          ISSUE_NUM=${{ github.event.issue.number }}
+          echo "$RESPONSE_BODY" > "kimi/response_${ISSUE_NUM}_${TIMESTAMP}.json"
+          
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ API调用失败，状态码: $HTTP_CODE"
+            echo "响应内容: $RESPONSE_BODY"
+            exit 1
+          fi
+          
+          OPTIMIZED_CODE=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // empty' | sed '/^```/d' | base64 -w0)
+          echo "OPTIMIZED_CODE_B64=$OPTIMIZED_CODE" >> "$GITHUB_OUTPUT"
+      
+      - name: 创建/更新目标文件
+        run: |
+          MODE="${{ steps.parse.outputs.MODE }}"
+          
+          if [ "$MODE" == "folder" ]; then
+            FILES_LIST=$(printf '%s' '${{ steps.current.outputs.FILES_LIST_B64 }}' | base64 -d)
+            FIRST_FILE=$(echo "$FILES_LIST" | head -1)
+            printf '%s' '${{ steps.ai.outputs.OPTIMIZED_CODE_B64 }}' | base64 -d > "$FIRST_FILE"
+            echo "✅ 批量模式 - 已更新第一个文件: $FIRST_FILE（TODO：扩展为循环处理所有文件）"
+          else
+            TARGET_FILE="${{ steps.parse.outputs.TARGET_FILE }}"
+            mkdir -p $(dirname "$TARGET_FILE")
+            printf '%s' '${{ steps.ai.outputs.OPTIMIZED_CODE_B64 }}' | base64 -d > "$TARGET_FILE"
+            echo "✅ 文件已生成/更新: $TARGET_FILE"
+          fi
+      
+      - name: 扫描并更新依赖
+        id: deps
+        run: |
+          python .ai/update_requirements.py --scan-path . --output requirements-ai.txt
+          if [ -n "$(git status --porcelain requirements-ai.txt)" ]; then
+            echo "DEP_UPDATED=true" >> "$GITHUB_OUTPUT"
+            echo "📦 依赖已更新"
+          else
+            echo "DEP_UPDATED=false" >> "$GITHUB_OUTPUT"
+          fi
+      
+      - name: 创建Pull Request（携带原始Issue上下文）
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          title: "🤖 Kimi优化: ${{ steps.parse.outputs.TARGET_FILE || steps.parse.outputs.FOLDER_PATH }}"
+          body: |
+            ## Kimi AI优化结果
+            
+            **原始Issue**: #${{ github.event.issue.number }}
+            **触发指令**: ${{ github.event.comment.body }}
+            **目标**: `${{ steps.parse.outputs.TARGET_FILE || steps.parse.outputs.FOLDER_PATH }}`
+            ${{ steps.deps.outputs.DEP_UPDATED == 'true' && '\n**依赖更新**: requirements-ai.txt 已自动更新' || '' }}
+            
+            ---            
+            1. 点击 [Files changed](https://github.com/${{ github.repository }}/pull/${{ github.event.issue.number }}/files) 查看代码
+            2. 如需调整，在本PR下评论 `@kimi-bot revise <新要求>`
+            3. 满意后点 "Merge pull request"
+            
+            <!-- ORIGINAL_ISSUE_CONTEXT
+            ISSUE_NUMBER: ${{ github.event.issue.number }}
+            ISSUE_TITLE: ${{ github.event.issue.title }}
+            ORIGINAL_COMMENT: ${{ github.event.comment.body }}
+            TARGET: ${{ steps.parse.outputs.TARGET_FILE || steps.parse.outputs.FOLDER_PATH }}
+            -->
+          branch: kimibot/optimize-${{ github.event.issue.number }}-${{ github.run_id }}
+          labels: kimi-optimized, automated
+          assignees: ${{ github.event.comment.user.login }}
+          commit-message: |
+            feat: Kimi优化 ${{ steps.parse.outputs.TARGET_FILE || steps.parse.outputs.FOLDER_PATH }}
+            ${{ steps.deps.outputs.DEP_UPDATED == 'true' && '\nbuild: 自动更新依赖' || '' }}
