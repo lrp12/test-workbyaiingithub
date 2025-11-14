@@ -14,6 +14,9 @@ jobs:
       issues: read
     
     steps:
+      # ==========================================
+      # Step 1: 获取Issue完整上下文（标题+正文）
+      # ==========================================
       - uses: actions/checkout@v4
       
       - name: 获取Issue完整上下文
@@ -21,56 +24,70 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            // 调用GitHub API获取Issue详情
             const issue = await github.rest.issues.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number
             });
             
+            // 清理标题和正文中的引号，防止Shell注入
             const title = issue.data.title.replace(/"/g, '\\"');
             const body = (issue.data.body || '').replace(/"/g, '\\"');
             
+            // 使用Base64编码安全传递特殊字符
             core.setOutput('issue_title_b64', Buffer.from(title).toString('base64'));
             core.setOutput('issue_body_b64', Buffer.from(body).toString('base64'));
+            console.log(`✅ 成功获取Issue #${context.issue.number}: ${title}`);
       
+      # ==========================================
+      # Step 2: 解析用户指令和输出路径
+      # ==========================================
       - name: 解析需求指令
         id: parse
         run: |
-          # ✅ 使用单引号防止变量提前展开
+          # 使用单引号防止GitHub变量提前展开
           FULL_COMMENT='${{ github.event.comment.body }}'
           echo "📝 原始指令: $FULL_COMMENT"
           
-          # 清理评论
+          # 移除触发词和代码块标记
           CLEAN_COMMENT=$(echo "$FULL_COMMENT" | sed 's/@kimi-bot create//gi' | sed 's/```//g')
           
-          # ✅ 改进的路径解析（移除引号）
+          # 解析输出根目录（可选参数）
           OUTPUT_PATH=$(echo "$CLEAN_COMMENT" | grep -oP 'o[:：]\s*\K[^ ]+' | head -1 | sed 's/["'\'']//g')
           if [ -n "$OUTPUT_PATH" ]; then
             echo "OUTPUT_PATH=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
             echo "🎯 输出根目录: $OUTPUT_PATH"
           else
             echo "OUTPUT_PATH=./kimi-created" >> "$GITHUB_OUTPUT"
+            echo "🎯 默认输出根目录: ./kimi-created"
           fi
           
-          # ✅ 提取补充指令
+          # 提取评论中的补充指令（移除输出路径部分）
           COMMENT_INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed 's/o[:：]\s*[^ ]\+//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           
-          # ✅ 关键修复：使用中间变量避免嵌套引号问题
+          # 关键修复：使用printf进行Base64编码，避免引号嵌套
           COMMENT_INSTRUCTION_B64=$(printf '%s' "$COMMENT_INSTRUCTION" | base64 -w0)
           echo "COMMENT_INSTRUCTION_B64=$COMMENT_INSTRUCTION_B64" >> "$GITHUB_OUTPUT"
+          echo "💡 补充指令: '$COMMENT_INSTRUCTION'"
       
-      - name: Kimi生成文件结构
+      # ==========================================
+      # Step 3: 调用Kimi API生成文件结构
+      # ==========================================
+      - name: Kimi生成文件结构（含完整上下文）
         id: ai
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
         run: |
-          # ✅ 安全解码
+          # 解码所有上下文信息
+          echo "🔍 正在解码上下文..."
           ISSUE_TITLE=$(printf '%s' '${{ steps.issue_context.outputs.issue_title_b64 }}' | base64 -d)
           ISSUE_BODY=$(printf '%s' '${{ steps.issue_context.outputs.issue_body_b64 }}' | base64 -d)
           COMMENT_INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.COMMENT_INSTRUCTION_B64 }}' | base64 -d)
           OUTPUT_PATH="${{ steps.parse.outputs.OUTPUT_PATH }}"
           
-          # ✅ 使用jq构建JSON避免引号问题
+          # 构建用户Prompt（使用jq避免引号问题）
+          echo "🧠 构建Prompt..."
           USER_CONTENT=$(jq -n \
             --arg title "$ISSUE_TITLE" \
             --arg body "$ISSUE_BODY" \
@@ -81,76 +98,127 @@ jobs:
               "issue_body": $body,
               "comment_instruction": $comment,
               "output_path": $output,
-              "requirements": "根据以上信息生成文件结构，返回JSON数组：[{\"path\": \"相对路径\", \"content\": \"代码\"}]"
+              "final_requirement": "根据以上信息生成完整项目文件结构，返回JSON数组"
             }' | jq -c .)
           
+          # 构建API请求Payload
           PAYLOAD=$(jq -n \
             --arg model "kimi-k2-0905-preview" \
             --arg prompt "$USER_CONTENT" \
             '{
               "model": $model,
               "messages": [
-                {"role": "system", "content": "你是资深工程师，严格返回JSON数组，无markdown。"},
-                {"role": "user", "content": $prompt}
+                {
+                  "role": "system", 
+                  "content": "你是资深全栈工程师。用户通过GitHub Issue提需求，你必须：1. 返回严格JSON数组格式 2. 每个元素包含path和content字段 3. 代码完整可运行 4. 无markdown标记 5. 最多20个文件"
+                },
+                {
+                  "role": "user", 
+                  "content": $prompt
+                }
               ],
               "temperature": 0.2
             }')
           
-          # API调用和后续处理...
+          # 调用Kimi API
+          echo "🚀 调用Kimi API..."
           RESPONSE=$(curl -s -w "\n%{http_code}" https://api.moonshot.cn/v1/chat/completions \
             -H "Authorization: Bearer $KIMI_API_KEY" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
           
+          # 分离HTTP状态码和响应体
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
           
-          # ✅ 保存响应
+          # 保存原始响应（便于调试）
           mkdir -p kimi
-          echo "$RESPONSE_BODY" > "kimi/response_create_${{ github.event.issue.number }}_$(date +%Y%m%d_%H%M%S).json"
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          ISSUE_NUM=${{ github.event.issue.number }}
+          echo "$RESPONSE_BODY" > "kimi/response_create_${ISSUE_NUM}_${TIMESTAMP}.json"
           
+          # 检查API调用是否成功
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ API失败，状态码: $HTTP_CODE"
+            echo "❌ API调用失败，状态码: $HTTP_CODE"
+            echo "响应内容: $RESPONSE_BODY"
             exit 1
           fi
           
+          # 提取AI响应并验证JSON格式
           AI_RESPONSE=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // empty')
-          FILE_COUNT=$(echo "$AI_RESPONSE" | jq 'length')
+          echo "$AI_RESPONSE" | jq 'type == "array"' > /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "❌ AI响应不是有效的JSON数组"
+            echo "原始响应: $AI_RESPONSE"
+            exit 1
+          fi
           
-          # ✅ 关键修复：使用printf保存base64
+          # 限制文件数量
+          FILE_COUNT=$(echo "$AI_RESPONSE" | jq 'length')
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "⚠️  AI未生成任何文件"
+            exit 1
+          fi
+          
+          if [ "$FILE_COUNT" -gt 20 ]; then
+            echo "⚠️  AI生成了 $FILE_COUNT 个文件，仅保留前20个"
+            AI_RESPONSE=$(echo "$AI_RESPONSE" | jq '.[0:20]')
+            FILE_COUNT=20
+          fi
+          
+          # 保存到输出（关键修复：使用printf）
           AI_RESPONSE_B64=$(printf '%s' "$AI_RESPONSE" | base64 -w0)
           echo "AI_RESPONSE_B64=$AI_RESPONSE_B64" >> "$GITHUB_OUTPUT"
           echo "FILE_COUNT=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "✅ Kimi批量处理完成，共 $FILE_COUNT 个文件"
       
+      # ==========================================
+      # Step 4: 创建文件结构（带冲突检测）
+      # ==========================================
       - name: 创建文件结构
         run: |
-          # ✅ 安全解码
+          # 解码AI响应
           AI_RESPONSE=$(printf '%s' '${{ steps.ai.outputs.AI_RESPONSE_B64 }}' | base64 -d)
           OUTPUT_PATH="${{ steps.parse.outputs.OUTPUT_PATH }}"
           
-          # 冲突检测（改进版）
+          # 文件冲突检测
+          echo "🔒 检测文件冲突..."
           CONFLICTS=$(echo "$AI_RESPONSE" | jq -r '.[].path' | while read path; do
-            FULL_PATH="${OUTPUT_PATH%/}/$path"
+            CLEAN_PATH=$(echo "$path" | sed 's/^\.\///' | sed 's/^\///')
+            FULL_PATH="${OUTPUT_PATH%/}/$CLEAN_PATH"
             [ -f "$FULL_PATH" ] && echo "$FULL_PATH"
           done)
           
           if [ -n "$CONFLICTS" ]; then
-            echo "❌ 文件已存在:"
+            echo "❌ 以下文件已存在，为避免覆盖已跳过:"
             echo "$CONFLICTS"
+            echo "提示: 如需继续，请删除现有文件或使用不同的输出目录"
             exit 1
           fi
           
-          # ✅ 创建文件（使用jq -r安全提取）
+          # 创建文件
+          echo "📁 开始创建文件..."
+          CREATED_COUNT=0
           echo "$AI_RESPONSE" | jq -c '.[]' | while IFS= read -r item; do
             FILE_PATH=$(echo "$item" | jq -r '.path')
             CONTENT=$(echo "$item" | jq -r '.content')
-            FULL_PATH="${OUTPUT_PATH%/}/$FILE_PATH"
             
+            # 清理路径
+            CLEAN_PATH=$(echo "$FILE_PATH" | sed 's/^\.\///' | sed 's/^\///')
+            FULL_PATH="${OUTPUT_PATH%/}/$CLEAN_PATH"
+            
+            # 创建目录并写入文件
             mkdir -p "$(dirname "$FULL_PATH")"
             printf '%s' "$CONTENT" > "$FULL_PATH"
             echo "✅ 创建: $FULL_PATH"
+            CREATED_COUNT=$((CREATED_COUNT + 1))
           done
+          
+          echo "CREATED_COUNT=$CREATED_COUNT" >> "$GITHUB_ENV"
       
+      # ==========================================
+      # Step 5: 创建Pull Request
+      # ==========================================
       - name: 创建Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
@@ -167,10 +235,23 @@ jobs:
             
             ---
             ### 📋 使用说明
-            1. 点击 [Files changed](...) 查看代码
-            2. 如需调整，评论 `@kimi-bot revise 新要求`
-            3. 满意后点 **"Merge pull request"**
+            1. 点击 [Files changed](https://github.com/${{ github.repository }}/pull/${{ github.event.issue.number }}/files) 查看代码
+            2. 如需调整，在本PR下评论 `@kimi-bot revise 新要求`
+            3. 如需优化现有文件，使用 `@kimi-bot optimize i:文件路径`
+            4. 满意后点 **"Merge pull request"** 合并
+            
+            <!-- ORIGINAL_ISSUE_CONTEXT
+            ISSUE_NUMBER: ${{ github.event.issue.number }}
+            ISSUE_TITLE: ${{ github.event.issue.title }}
+            ORIGINAL_COMMENT: ${{ github.event.comment.body }}
+            FILE_COUNT: ${{ steps.ai.outputs.FILE_COUNT }}
+            OUTPUT_PATH: ${{ steps.parse.outputs.OUTPUT_PATH }}
+            IS_CREATION: true
+            -->
           branch: kimibot/create-${{ github.event.issue.number }}-${{ github.run_id }}
-          labels: kimi-created, automated
+          labels: kimi-created, automated, feature
           assignees: ${{ github.event.comment.user.login }}
-          commit-message: "feat: Kimi自动实现 #${{ github.event.issue.number }}"
+          commit-message: |
+            feat: Kimi自动实现 #${{ github.event.issue.number }}
+            
+            ${{ github.event.issue.title }}
