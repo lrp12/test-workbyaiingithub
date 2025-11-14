@@ -421,20 +421,20 @@ jobs:
             const timestamp = new Date().toISOString();
             const enhanceReport = `## 🤖 Kimi迭代增强报告（${timestamp}）
             
-**触发指令**: \`${{ github.event.comment.body }}\`
-**执行结果**: ✅ 修改 ${modifiedCount} 个文件，➕ 创建 ${createdCount} 个新文件，❌ 失败 ${failedCount} 个
-
----
-
-### 📝 修改的文件
-${modifiedFiles.length > 0 ? modifiedFiles.map(f => `- ${f}`).join('\n') : '（无）'}
-
-### ➕ 创建的新文件
-${createdFiles.length > 0 ? createdFiles.map(f => `- ${f} ⚠️ 新`).join('\n') : '（无）'}
-
----
-ℹ️ 由 @${{ github.event.comment.user.login }} 通过 \`@kimi-bot revise\` 触发
-`;
+              **触发指令**: \`${{ github.event.comment.body }}\`
+              **执行结果**: ✅ 修改 ${modifiedCount} 个文件，➕ 创建 ${createdCount} 个新文件，❌ 失败 ${failedCount} 个
+              
+              ---
+              
+              ### 📝 修改的文件
+              ${modifiedFiles.length > 0 ? modifiedFiles.map(f => `- ${f}`).join('\n') : '（无）'}
+              
+              ### ➕ 创建的新文件
+              ${createdFiles.length > 0 ? createdFiles.map(f => `- ${f} ⚠️ 新`).join('\n') : '（无）'}
+              
+              ---
+              ℹ️ 由 @${{ github.event.comment.user.login }} 通过 \`@kimi-bot revise\` 触发
+              `;
             
             // 在PR描述末尾添加新报告（保留原有内容）
             const newBody = pr.body + '\n\n---\n' + enhanceReport;
