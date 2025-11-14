@@ -9,9 +9,13 @@ import sys
 import requests
 from win10toast import ToastNotifier
 
-CONFIG_FILE = "config.json"
-LOG_FILE = "logs/gold_price.log"
-HISTORY_FILE = "data/price_history.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+LOG_FILE = os.path.join(BASE_DIR, "logs", "gold_price.log")
+HISTORY_FILE = os.path.join(BASE_DIR, "data", "price_history.json")
+
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
