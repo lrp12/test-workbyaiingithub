@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # 判断是否为PR，是则检出PR分支，否则检出当前分支
-          ref: ${{ github.event.issue.pull_request && format('refs/heads/{0}', github.event.issue.pull_request.head.ref) || github.ref }}
+          ref: ${{ github.head_ref }}
       
       # ==========================================
       # Step 2: 获取PR上下文
