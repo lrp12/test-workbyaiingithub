@@ -11,7 +11,7 @@ on:
 jobs:
   ai-revise:
     # 触发条件：评论包含@kimi-bot revise
-    if: contains(github.event.comment.body, '@kimi-bot revise1')
+    if: contains(github.event.comment.body, '@kimi-bot revis')
     runs-on: ubuntu-latest
     permissions:
       contents: write
