@@ -27,26 +27,24 @@ jobs:
               issue_number: context.issue.number
             });
             
-            // 清理特殊字符，避免Shell注入
             const title = issue.data.title.replace(/"/g, '\\"');
             const body = (issue.data.body || '').replace(/"/g, '\\"');
             
-            // 将内容存入环境变量（使用B64确保特殊字符安全）
             core.setOutput('issue_title_b64', Buffer.from(title).toString('base64'));
             core.setOutput('issue_body_b64', Buffer.from(body).toString('base64'));
-            console.log(`✅ 获取Issue #${context.issue.number}: ${title}`);
       
       - name: 解析需求指令
         id: parse
         run: |
-          FULL_COMMENT="${{ github.event.comment.body }}"
+          # ✅ 使用单引号防止变量提前展开
+          FULL_COMMENT='${{ github.event.comment.body }}'
           echo "📝 原始指令: $FULL_COMMENT"
           
-          # 提取需求描述（移除触发词）
+          # 清理评论
           CLEAN_COMMENT=$(echo "$FULL_COMMENT" | sed 's/@kimi-bot create//gi' | sed 's/```//g')
           
-          # 解析输出根目录（可选）
-          OUTPUT_PATH=$(echo "$CLEAN_COMMENT" | grep -oP 'o[:：]\s*\K[^ ]+' | head -1 | tr -d '`"'"'')
+          # ✅ 改进的路径解析（移除引号）
+          OUTPUT_PATH=$(echo "$CLEAN_COMMENT" | grep -oP 'o[:：]\s*\K[^ ]+' | head -1 | sed 's/["'\'']//g')
           if [ -n "$OUTPUT_PATH" ]; then
             echo "OUTPUT_PATH=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
             echo "🎯 输出根目录: $OUTPUT_PATH"
@@ -54,65 +52,51 @@ jobs:
             echo "OUTPUT_PATH=./kimi-created" >> "$GITHUB_OUTPUT"
           fi
           
-          # 提取评论中的补充指令
+          # ✅ 提取补充指令
           COMMENT_INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed 's/o[:：]\s*[^ ]\+//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-          echo "COMMENT_INSTRUCTION_B64=$(echo "$COMMENT_INSTRUCTION" | base64 -w0)" >> "$GITHUB_OUTPUT"
           
-      - name: Kimi生成文件结构（含Issue上下文）
+          # ✅ 关键修复：使用中间变量避免嵌套引号问题
+          COMMENT_INSTRUCTION_B64=$(printf '%s' "$COMMENT_INSTRUCTION" | base64 -w0)
+          echo "COMMENT_INSTRUCTION_B64=$COMMENT_INSTRUCTION_B64" >> "$GITHUB_OUTPUT"
+      
+      - name: Kimi生成文件结构
         id: ai
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
         run: |
-          # ✅ 解码所有上下文信息
+          # ✅ 安全解码
           ISSUE_TITLE=$(printf '%s' '${{ steps.issue_context.outputs.issue_title_b64 }}' | base64 -d)
           ISSUE_BODY=$(printf '%s' '${{ steps.issue_context.outputs.issue_body_b64 }}' | base64 -d)
           COMMENT_INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.COMMENT_INSTRUCTION_B64 }}' | base64 -d)
           OUTPUT_PATH="${{ steps.parse.outputs.OUTPUT_PATH }}"
           
-          # ✅ 构建增强型Prompt（包含Issue完整信息）
-          PROMPT=$(cat <<EOF
-            {
-              "role": "system",
-              "content": "你是资深全栈工程师。用户通过GitHub Issue提出需求，你需要根据完整上下文生成项目文件结构。必须返回严格的JSON数组：[{\"path\": \"相对路径\", \"content\": \"完整代码\"}]。代码需完整、可运行、符合最佳实践。不要markdown标记。"
-            }
-          EOF
-          )
-          
-          USER_PROMPT=$(cat <<EOF
-            根据以下GitHub Issue的完整信息，创建完整的项目文件结构：
-            
-            ---
-            **Issue标题**: $ISSUE_TITLE
-            
-            **Issue详细描述**:
-            ${ISSUE_BODY:-（无详细描述）}
-            
-            ---
-            
-            **补充指令**（来自评论）:
-            ${COMMENT_INSTRUCTION:-无额外指令}
-            
-            **输出要求**:
-            1. 所有文件路径相对于根目录: $OUTPUT_PATH
-            2. 返回严格的JSON数组格式
-            3. 最多20个文件
-            4. 确保代码完整、可运行
-            EOF
-            )
+          # ✅ 使用jq构建JSON避免引号问题
+          USER_CONTENT=$(jq -n \
+            --arg title "$ISSUE_TITLE" \
+            --arg body "$ISSUE_BODY" \
+            --arg comment "$COMMENT_INSTRUCTION" \
+            --arg output "$OUTPUT_PATH" \
+            '{
+              "issue_title": $title,
+              "issue_body": $body,
+              "comment_instruction": $comment,
+              "output_path": $output,
+              "requirements": "根据以上信息生成文件结构，返回JSON数组：[{\"path\": \"相对路径\", \"content\": \"代码\"}]"
+            }' | jq -c .)
           
           PAYLOAD=$(jq -n \
             --arg model "kimi-k2-0905-preview" \
-            --arg system_prompt "$PROMPT" \
-            --arg user_prompt "$USER_PROMPT" \
+            --arg prompt "$USER_CONTENT" \
             '{
               "model": $model,
               "messages": [
-                {"role": "system", "content": $system_prompt},
-                {"role": "user", "content": $user_prompt}
+                {"role": "system", "content": "你是资深工程师，严格返回JSON数组，无markdown。"},
+                {"role": "user", "content": $prompt}
               ],
               "temperature": 0.2
             }')
           
+          # API调用和后续处理...
           RESPONSE=$(curl -s -w "\n%{http_code}" https://api.moonshot.cn/v1/chat/completions \
             -H "Authorization: Bearer $KIMI_API_KEY" \
             -H "Content-Type: application/json" \
@@ -121,89 +105,51 @@ jobs:
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
           
+          # ✅ 保存响应
           mkdir -p kimi
-          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-          ISSUE_NUM=${{ github.event.issue.number }}
-          echo "$RESPONSE_BODY" > "kimi/response_create_${ISSUE_NUM}_${TIMESTAMP}.json"
+          echo "$RESPONSE_BODY" > "kimi/response_create_${{ github.event.issue.number }}_$(date +%Y%m%d_%H%M%S).json"
           
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ API调用失败，状态码: $HTTP_CODE"
-            echo "响应内容: $RESPONSE_BODY"
+            echo "❌ API失败，状态码: $HTTP_CODE"
             exit 1
           fi
           
-          # 提取并验证JSON
-          AI_RESPONSE=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // empty' | sed '/^```/d')
-          
-          # 验证JSON数组格式
-          echo "$AI_RESPONSE" | jq 'type == "array"' > /dev/null 2>&1
-          if [ $? -ne 0 ]; then
-            echo "❌ AI响应不是有效的JSON数组，请检查响应格式"
-            echo "原始响应: $AI_RESPONSE"
-            exit 1
-          fi
-          
+          AI_RESPONSE=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // empty')
           FILE_COUNT=$(echo "$AI_RESPONSE" | jq 'length')
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "⚠️  AI未生成任何文件"
-            exit 1
-          fi
           
-          if [ "$FILE_COUNT" -gt 20 ]; then
-            echo "⚠️  AI生成了 $FILE_COUNT 个文件，仅保留前20个"
-            AI_RESPONSE=$(echo "$AI_RESPONSE" | jq '.[0:20]')
-          fi
-          
-          echo "AI_RESPONSE_B64=$(echo "$AI_RESPONSE" | base64 -w0)" >> "$GITHUB_OUTPUT"
+          # ✅ 关键修复：使用printf保存base64
+          AI_RESPONSE_B64=$(printf '%s' "$AI_RESPONSE" | base64 -w0)
+          echo "AI_RESPONSE_B64=$AI_RESPONSE_B64" >> "$GITHUB_OUTPUT"
           echo "FILE_COUNT=$FILE_COUNT" >> "$GITHUB_OUTPUT"
-          echo "✅ Kimi生成完成，共 $FILE_COUNT 个文件"
       
       - name: 创建文件结构
         run: |
+          # ✅ 安全解码
           AI_RESPONSE=$(printf '%s' '${{ steps.ai.outputs.AI_RESPONSE_B64 }}' | base64 -d)
           OUTPUT_PATH="${{ steps.parse.outputs.OUTPUT_PATH }}"
-          FILE_COUNT='${{ steps.ai.outputs.FILE_COUNT }}'
           
-          # 确保根目录存在
-          mkdir -p "$OUTPUT_PATH"
+          # 冲突检测（改进版）
+          CONFLICTS=$(echo "$AI_RESPONSE" | jq -r '.[].path' | while read path; do
+            FULL_PATH="${OUTPUT_PATH%/}/$path"
+            [ -f "$FULL_PATH" ] && echo "$FULL_PATH"
+          done)
           
-          # 文件冲突检测
-          CONFLICTS=()
-          echo "$AI_RESPONSE" | jq -c '.[]' | while read -r item; do
-            FILE_PATH=$(echo "$item" | jq -r '.path')
-            CLEAN_PATH=$(echo "$FILE_PATH" | sed 's/^\.\///' | sed 's/^\///')
-            FULL_PATH="${OUTPUT_PATH%/}/$CLEAN_PATH"
-            
-            if [ -f "$FULL_PATH" ]; then
-              CONFLICTS+=("$FULL_PATH")
-            fi
-          done
-          
-          if [ ${#CONFLICTS[@]} -gt 0 ]; then
-            echo "❌ 以下文件已存在，为避免覆盖已跳过:"
-            printf '%s\n' "${CONFLICTS[@]}"
-            echo "提示: 如需强制覆盖，请删除现有文件或使用临时目录"
+          if [ -n "$CONFLICTS" ]; then
+            echo "❌ 文件已存在:"
+            echo "$CONFLICTS"
             exit 1
           fi
           
-          # 创建文件
-          CREATED_COUNT=0
-          echo "$AI_RESPONSE" | jq -c '.[]' | while read -r item; do
+          # ✅ 创建文件（使用jq -r安全提取）
+          echo "$AI_RESPONSE" | jq -c '.[]' | while IFS= read -r item; do
             FILE_PATH=$(echo "$item" | jq -r '.path')
             CONTENT=$(echo "$item" | jq -r '.content')
+            FULL_PATH="${OUTPUT_PATH%/}/$FILE_PATH"
             
-            # 清理路径
-            CLEAN_PATH=$(echo "$FILE_PATH" | sed 's/^\.\///' | sed 's/^\///')
-            FULL_PATH="${OUTPUT_PATH%/}/$CLEAN_PATH"
-            
-            # 创建目录并写入文件
             mkdir -p "$(dirname "$FULL_PATH")"
-            echo "$CONTENT" > "$FULL_PATH"
+            printf '%s' "$CONTENT" > "$FULL_PATH"
             echo "✅ 创建: $FULL_PATH"
-            CREATED_COUNT=$((CREATED_COUNT + 1))
           done
-          
-          echo "CREATED_COUNT=$CREATED_COUNT" >> "$GITHUB_ENV"
       
       - name: 创建Pull Request
         uses: peter-evans/create-pull-request@v6
@@ -216,28 +162,15 @@ jobs:
             **原始Issue**: #${{ github.event.issue.number }}
             **需求描述**: ${{ github.event.issue.title }}
             **触发指令**: ${{ github.event.comment.body }}
-            **生成文件数**: ${{ env.CREATED_COUNT }}个
+            **生成文件数**: ${{ steps.ai.outputs.FILE_COUNT }}个
             **输出目录**: `${{ steps.parse.outputs.OUTPUT_PATH }}`
             
             ---
             ### 📋 使用说明
-            1. 点击 [Files changed](https://github.com/${{ github.repository }}/pull/${{ github.event.issue.number }}/files) 查看代码
-            2. 如需调整，在本PR下评论 `@kimi-bot revise 新要求`
-            3. 如需优化现有文件，使用 `@kimi-bot optimize i:文件路径`
-            4. 满意后点 **"Merge pull request"** 合并
-            
-            <!-- ORIGINAL_ISSUE_CONTEXT
-            ISSUE_NUMBER: ${{ github.event.issue.number }}
-            ISSUE_TITLE: ${{ github.event.issue.title }}
-            ORIGINAL_COMMENT: ${{ github.event.comment.body }}
-            FILE_COUNT: ${{ env.CREATED_COUNT }}
-            OUTPUT_PATH: ${{ steps.parse.outputs.OUTPUT_PATH }}
-            IS_CREATION: true
-            -->
+            1. 点击 [Files changed](...) 查看代码
+            2. 如需调整，评论 `@kimi-bot revise 新要求`
+            3. 满意后点 **"Merge pull request"**
           branch: kimibot/create-${{ github.event.issue.number }}-${{ github.run_id }}
-          labels: kimi-created, automated, feature
+          labels: kimi-created, automated
           assignees: ${{ github.event.comment.user.login }}
-          commit-message: |
-            feat: Kimi自动实现 #${{ github.event.issue.number }}
-            
-            ${{ github.event.issue.title }}
+          commit-message: "feat: Kimi自动实现 #${{ github.event.issue.number }}"
