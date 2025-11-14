@@ -16,53 +16,99 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      - name: 获取Issue完整上下文
+        id: issue_context
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            
+            // 清理特殊字符，避免Shell注入
+            const title = issue.data.title.replace(/"/g, '\\"');
+            const body = (issue.data.body || '').replace(/"/g, '\\"');
+            
+            // 将内容存入环境变量（使用B64确保特殊字符安全）
+            core.setOutput('issue_title_b64', Buffer.from(title).toString('base64'));
+            core.setOutput('issue_body_b64', Buffer.from(body).toString('base64'));
+            console.log(`✅ 获取Issue #${context.issue.number}: ${title}`);
+      
       - name: 解析需求指令
         id: parse
         run: |
           FULL_COMMENT="${{ github.event.comment.body }}"
           echo "📝 原始指令: $FULL_COMMENT"
           
-          # 提取需求描述
+          # 提取需求描述（移除触发词）
           CLEAN_COMMENT=$(echo "$FULL_COMMENT" | sed 's/@kimi-bot create//gi' | sed 's/```//g')
           
-          # 解析输出根目录（可选，默认./kimi-created）
+          # 解析输出根目录（可选）
           OUTPUT_PATH=$(echo "$CLEAN_COMMENT" | grep -oP 'o[:：]\s*\K[^ ]+' | head -1 | tr -d '`"'"'')
           if [ -n "$OUTPUT_PATH" ]; then
             echo "OUTPUT_PATH=$OUTPUT_PATH" >> "$GITHUB_OUTPUT"
             echo "🎯 输出根目录: $OUTPUT_PATH"
           else
             echo "OUTPUT_PATH=./kimi-created" >> "$GITHUB_OUTPUT"
-            echo "🎯 默认输出根目录: ./kimi-created"
           fi
           
-          # 提取核心需求（移除输出路径参数）
-          CORE_INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed 's/o[:：]\s*[^ ]\+//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-          if [ -z "$CORE_INSTRUCTION" ]; then
-            echo "❌ 必须提供需求描述，例如: 创建一个Python CLI工具，支持..."
-            exit 1
-          fi
-          echo "CORE_INSTRUCTION_B64=$(echo "$CORE_INSTRUCTION" | base64 -w0)" >> "$GITHUB_OUTPUT"
-          echo "💡 核心需求: '$CORE_INSTRUCTION'"
-      
-      - name: Kimi生成文件结构
+          # 提取评论中的补充指令
+          COMMENT_INSTRUCTION=$(echo "$CLEAN_COMMENT" | sed 's/o[:：]\s*[^ ]\+//g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          echo "COMMENT_INSTRUCTION_B64=$(echo "$COMMENT_INSTRUCTION" | base64 -w0)" >> "$GITHUB_OUTPUT"
+          
+      - name: Kimi生成文件结构（含Issue上下文）
         id: ai
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
         run: |
-          CORE_INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.CORE_INSTRUCTION_B64 }}' | base64 -d)
+          # ✅ 解码所有上下文信息
+          ISSUE_TITLE=$(printf '%s' '${{ steps.issue_context.outputs.issue_title_b64 }}' | base64 -d)
+          ISSUE_BODY=$(printf '%s' '${{ steps.issue_context.outputs.issue_body_b64 }}' | base64 -d)
+          COMMENT_INSTRUCTION=$(printf '%s' '${{ steps.parse.outputs.COMMENT_INSTRUCTION_B64 }}' | base64 -d)
           OUTPUT_PATH="${{ steps.parse.outputs.OUTPUT_PATH }}"
           
-          # 构建生成Prompt
-          PROMPT=$(printf '你是一个资深全栈工程师。根据以下需求，设计并实现完整的项目文件结构。\n\n需求描述：%s\n\n要求：\n1. 返回严格的JSON数组：[{\"path\": \"文件相对路径\", \"content\": \"完整文件内容\"}]\n2. 所有路径相对于根目录 \"%s\"\n3. 代码必须完整、可运行、符合最佳实践\n4. 不要包含任何markdown标记或说明文字\n5. 最多生成20个文件\n\n示例响应格式：\n[{\"path\": \"main.py\", \"content\": \"import sys\\n...\"}, {\"path\": \"utils/helper.py\", \"content\": \"def foo():\\n    pass\"}]' "$CORE_INSTRUCTION" "$OUTPUT_PATH")
+          # ✅ 构建增强型Prompt（包含Issue完整信息）
+          PROMPT=$(cat <<EOF
+            {
+              "role": "system",
+              "content": "你是资深全栈工程师。用户通过GitHub Issue提出需求，你需要根据完整上下文生成项目文件结构。必须返回严格的JSON数组：[{\"path\": \"相对路径\", \"content\": \"完整代码\"}]。代码需完整、可运行、符合最佳实践。不要markdown标记。"
+            }
+          EOF
+          )
+          
+          USER_PROMPT=$(cat <<EOF
+            根据以下GitHub Issue的完整信息，创建完整的项目文件结构：
+            
+            ---
+            **Issue标题**: $ISSUE_TITLE
+            
+            **Issue详细描述**:
+            ${ISSUE_BODY:-（无详细描述）}
+            
+            ---
+            
+            **补充指令**（来自评论）:
+            ${COMMENT_INSTRUCTION:-无额外指令}
+            
+            **输出要求**:
+            1. 所有文件路径相对于根目录: $OUTPUT_PATH
+            2. 返回严格的JSON数组格式
+            3. 最多20个文件
+            4. 确保代码完整、可运行
+            EOF
+            )
           
           PAYLOAD=$(jq -n \
-            --arg prompt "$PROMPT" \
             --arg model "kimi-k2-0905-preview" \
+            --arg system_prompt "$PROMPT" \
+            --arg user_prompt "$USER_PROMPT" \
             '{
               "model": $model,
               "messages": [
-                {"role": "system", "content": "你严格返回JSON数组，不添加任何其他文本。确保path和content字段完整。"},
-                {"role": "user", "content": $prompt}
+                {"role": "system", "content": $system_prompt},
+                {"role": "user", "content": $user_prompt}
               ],
               "temperature": 0.2
             }')
