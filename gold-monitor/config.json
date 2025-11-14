@@ -1,0 +1,6 @@
+{
+  "threshold": 0.5,
+  "interval": 60,
+  "app_key": "YOUR_JD_APP_KEY",
+  "secret": "YOUR_JD_SECRET"
+}
