@@ -1,0 +1,29 @@
+name: run-shell-and-commit
+on:
+  issues:
+    types: [opened, edited]
+
+jobs:
+  run-and-commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: read
+    if: contains(github.event.issue.body, '@kimi-bot run')
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p "${{ github.event.issue.body }}"
+      - run: |
+          set -e
+          scripts=$(find . -name "*.sh" -type f)
+          for s in $scripts; do
+            echo "Running $s"
+            bash "$s"
+          done
+        env:
+          OUTPUT_DIR: "${{ github.event.issue.body }}"
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --cached --quiet || (git commit -m "Automated: save generated files" && git push)
