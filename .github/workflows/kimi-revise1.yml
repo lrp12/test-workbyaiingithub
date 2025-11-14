@@ -105,84 +105,84 @@ jobs:
       # 将文件内容编码为Base64，构建JSON数组
       # ==========================================
       - name: 读取当前文件（支持所有类型）
-  id: current
-  run: |
-    TARGETS='${{ steps.parse.outputs.TARGET_FILES }}'
-    echo "📂 正在读取目标文件: $TARGETS"
-    
-    ALL_FILES=""
-    IFS=',' read -ra PATHS <<< "$TARGETS"
-    
-    for path in "${PATHS[@]}"; do
-      path=$(echo "$path" | xargs)  # 移除空格
-      
-      if [[ "$path" == *"*"* ]]; then
-        # 通配符模式（支持所有文件）
-        MATCHED=$(find . -path "$path" -type f 2>/dev/null || echo "")
-        ALL_FILES="$ALL_FILES"$'\n'"$MATCHED"
-      
-      elif [ -f "$path" ]; then
-        # 单个文件（任意类型）
-        ALL_FILES="$ALL_FILES"$'\n'"$path"
-      
-      elif [ -d "$path" ]; then
-        # 目录：递归查找所有文件（不再是仅.py）
-        echo "⚠️  目录路径，将查找所有类型文件"
-        MATCHED=$(find "$path" -type f 2>/dev/null || echo "")
-        # 可选：排除某些目录（如node_modules, .git）
-        MATCHED=$(echo "$MATCHED" | grep -vE '(\.git|node_modules|__pycache__)')
-        ALL_FILES="$ALL_FILES"$'\n'"$MATCHED"
-      
-      else
-        echo "⚠️  警告: 路径不存在或无法识别: $path"
-      fi
-    done
-    
-    # 去重并限制数量
-    UNIQUE_FILES=$(echo "$ALL_FILES" | grep -v '^$' | sort | uniq)
-    FILE_COUNT=$(echo "$UNIQUE_FILES" | wc -l)
-    
-    if [ "$FILE_COUNT" -eq 0 ]; then
-      echo "❌ 未找到任何有效文件"
-      exit 1
-    fi
-    
-    if [ "$FILE_COUNT" -gt 10 ]; then
-      echo "⚠️  警告: 找到 $FILE_COUNT 个文件，最多处理10个，将处理前10个"
-      UNIQUE_FILES=$(echo "$UNIQUE_FILES" | head -10)
-      FILE_COUNT=10
-    fi
-    
-    # 构建JSON数组
-    echo "FILES_JSON<<EOF" >> "$GITHUB_OUTPUT"
-    echo "[" >> "$GITHUB_OUTPUT"
-    
-    FIRST=true
-    while IFS= read -r file; do
-      [ -z "$file" ] && continue
-      
-      if [ "$FIRST" = true ]; then
-        FIRST=false
-      else
-        echo "," >> "$GITHUB_OUTPUT"
-      fi
-      
-      # 读取任意文件内容（不限制类型）
-      CODE_B64=$(base64 -w0 < "$file" 2>/dev/null || echo "")
-      CODE_LEN=$(wc -c < "$file" 2>/dev/null || echo "0")
-      
-      cat >> "$GITHUB_OUTPUT" <<ITEM
-      {
-        "path": "$file",
-        "size": $CODE_LEN,
-        "content_b64": "$CODE_B64"
-      }
-ITEM
-    done <<< "$UNIQUE_FILES"
-    
-    echo "]" >> "$GITHUB_OUTPUT"
-    echo "EOF" >> "$GITHUB_OUTPUT"
-    echo "✅ 成功读取 $FILE_COUNT 个文件"
+        id: current
+        run: |
+          TARGETS='${{ steps.parse.outputs.TARGET_FILES }}'
+          echo "📂 正在读取目标文件: $TARGETS"
+          
+          ALL_FILES=""
+          IFS=',' read -ra PATHS <<< "$TARGETS"
+          
+          for path in "${PATHS[@]}"; do
+            path=$(echo "$path" | xargs)  # 移除空格
+            
+            if [[ "$path" == *"*"* ]]; then
+              # 通配符模式（支持所有文件）
+              MATCHED=$(find . -path "$path" -type f 2>/dev/null || echo "")
+              ALL_FILES="$ALL_FILES"$'\n'"$MATCHED"
+            
+            elif [ -f "$path" ]; then
+              # 单个文件（任意类型）
+              ALL_FILES="$ALL_FILES"$'\n'"$path"
+            
+            elif [ -d "$path" ]; then
+              # 目录：递归查找所有文件（不再是仅.py）
+              echo "⚠️  目录路径，将查找所有类型文件"
+              MATCHED=$(find "$path" -type f 2>/dev/null || echo "")
+              # 可选：排除某些目录（如node_modules, .git）
+              MATCHED=$(echo "$MATCHED" | grep -vE '(\.git|node_modules|__pycache__)')
+              ALL_FILES="$ALL_FILES"$'\n'"$MATCHED"
+            
+            else
+              echo "⚠️  警告: 路径不存在或无法识别: $path"
+            fi
+          done
+          
+          # 去重并限制数量
+          UNIQUE_FILES=$(echo "$ALL_FILES" | grep -v '^$' | sort | uniq)
+          FILE_COUNT=$(echo "$UNIQUE_FILES" | wc -l)
+          
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "❌ 未找到任何有效文件"
+            exit 1
+          fi
+          
+          if [ "$FILE_COUNT" -gt 10 ]; then
+            echo "⚠️  警告: 找到 $FILE_COUNT 个文件，最多处理10个，将处理前10个"
+            UNIQUE_FILES=$(echo "$UNIQUE_FILES" | head -10)
+            FILE_COUNT=10
+          fi
+          
+          # 构建JSON数组
+          echo "FILES_JSON<<EOF" >> "$GITHUB_OUTPUT"
+          echo "[" >> "$GITHUB_OUTPUT"
+          
+          FIRST=true
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              echo "," >> "$GITHUB_OUTPUT"
+            fi
+            
+            # 读取任意文件内容（不限制类型）
+            CODE_B64=$(base64 -w0 < "$file" 2>/dev/null || echo "")
+            CODE_LEN=$(wc -c < "$file" 2>/dev/null || echo "0")
+            
+            cat >> "$GITHUB_OUTPUT" <<ITEM
+            {
+              "path": "$file",
+              "size": $CODE_LEN,
+              "content_b64": "$CODE_B64"
+            }
+          ITEM
+          done <<< "$UNIQUE_FILES"
+          
+          echo "]" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "✅ 成功读取 $FILE_COUNT 个文件"
       
       # ==========================================
       # Step 5: Kimi生成修改和新增文件
