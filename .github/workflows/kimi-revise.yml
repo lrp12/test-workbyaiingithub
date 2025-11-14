@@ -6,7 +6,7 @@ on:
 
 jobs:
   ai-optimize:
-    if: contains(github.event.comment.body, '@kimi-bot optimize') && !github.event.issue.pull_request
+    if: contains(github.event.comment.body, '@kimi-bot revise') && !github.event.issue.pull_request
     runs-on: ubuntu-latest
     permissions:
       contents: write
