@@ -11,6 +11,9 @@ from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+import threading
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
@@ -42,34 +45,37 @@ RETRY_DELAY = cfg["retry_delay"]
 CHECK_INTERVAL = cfg["check_interval"]
 THRESHOLD = cfg["threshold"]
 
-def fetch_price(api_conf, retry=0):
-    try:
-        kw = {"timeout": api_conf["timeout"]}
-        if "headers" in api_conf:
-            kw["headers"] = api_conf["headers"]
-        if "params" in api_conf:
-            kw["params"] = api_conf["params"]
-        resp = requests.get(api_conf["url"], **kw)
-        resp.raise_for_status()
-        data = resp.json()
-        price = data
-        for key in api_conf["price_path"]:
-            price = price[key]
-        return float(price), ""
-    except Exception as exc:
-        err = f"{api_conf['name']} -> {type(exc).__name__}: {exc}"
-        logger.debug(err)
-        return None, err
+def fetch_price(api_conf):
+    for attempt in range(MAX_RETRY):
+        try:
+            kw = {"timeout": api_conf["timeout"]}
+            if "headers" in api_conf:
+                kw["headers"] = api_conf["headers"]
+            if "params" in api_conf:
+                kw["params"] = api_conf["params"]
+            resp = requests.get(api_conf["url"], **kw)
+            resp.raise_for_status()
+            data = resp.json()
+            price = data
+            for key in api_conf["price_path"]:
+                price = price[key]
+            return float(price), ""
+        except Exception as exc:
+            err = f"{api_conf['name']} -> {type(exc).__name__}: {exc}"
+            logger.debug(err)
+            if attempt < MAX_RETRY - 1:
+                time.sleep(RETRY_DELAY)
+    return None, err
 
 def get_gold_price():
     errors = []
-    for api in API_LIST:
-        for attempt in range(MAX_RETRY):
-            price, err = fetch_price(api, retry=attempt)
+    with ThreadPoolExecutor(max_workers=len(API_LIST)) as executor:
+        future_to_api = {executor.submit(fetch_price, api): api for api in API_LIST}
+        for future in as_completed(future_to_api):
+            price, err = future.result()
             if price is not None:
                 return price, errors
             errors.append(err)
-            time.sleep(RETRY_DELAY)
     return None, errors
 
 def load_history():
@@ -93,8 +99,10 @@ class App(tk.Tk):
         self.iconify()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.last_price = None
+        self.alert_queue = queue.Queue()
         self.build_ui()
         self.after(1000, self.scheduled_update)
+        self.after(100, self.process_alerts)
 
     def build_ui(self):
         frm = ttk.Frame(self, padding=12)
@@ -106,7 +114,7 @@ class App(tk.Tk):
         ttk.Label(frm, textvariable=self.status_var, font=("Arial", 10)).pack(pady=4)
 
     def scheduled_update(self):
-        self.update_price()
+        threading.Thread(target=self.update_price, daemon=True).start()
         self.after(CHECK_INTERVAL * 1000, self.scheduled_update)
 
     def update_price(self):
@@ -120,16 +128,22 @@ class App(tk.Tk):
         self.status_var.set(f"更新于 {ts.split('T')[1]}")
         save_history({"ts": ts, "price": price})
         if self.last_price is not None and abs(price - self.last_price) >= THRESHOLD:
-            self.alert(price, self.last_price)
+            self.alert_queue.put((price, self.last_price))
         self.last_price = price
         logger.info("Updated price: %.2f", price)
 
-    def alert(self, new, old):
-        diff = new - old
-        sign = "↑" if diff > 0 else "↓"
-        msg = f"金价变动 {sign} {abs(diff):.2f} USD/oz\n当前：{new:.2f}"
-        messagebox.showwarning("金价提醒", msg)
-        logger.warning("Alert: %s", msg)
+    def process_alerts(self):
+        try:
+            while True:
+                new, old = self.alert_queue.get_nowait()
+                diff = new - old
+                sign = "↑" if diff > 0 else "↓"
+                msg = f"金价变动 {sign} {abs(diff):.2f} USD/oz\n当前：{new:.2f}"
+                messagebox.showwarning("金价提醒", msg)
+                logger.warning("Alert: %s", msg)
+        except queue.Empty:
+            pass
+        self.after(100, self.process_alerts)
 
     def on_close(self):
         self.withdraw()
