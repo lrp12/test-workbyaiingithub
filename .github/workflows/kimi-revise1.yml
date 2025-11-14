@@ -101,7 +101,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          cd "${{ github.workspace }}"
+          # cd "${{ github.workspace }}"
           
           TARGETS='${{ steps.parse.outputs.TARGET_FILES }}'
           echo "📂 原始目标: $TARGETS"
