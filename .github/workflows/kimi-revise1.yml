@@ -89,67 +89,108 @@ jobs:
       # 读取目标文件内容，构建JSON数组
       # 支持所有文件类型（不限于.py）
       # ==========================================
+      # ==========================================
+      # Step 4: ✅ 终极修复：逐行处理替代数组分割
+      # 支持文件、目录、通配符、不存在的文件
+      # ==========================================
       - name: 读取当前文件
         id: current
+        shell: bash
         run: |
-
+          set -e  # 遇到错误立即退出
+          
+          # ✅ 强制回到仓库根目录
           cd "${{ github.workspace }}"
-          echo "📍 当前工作目录: $(pwd)"
+          echo "📍 工作目录: $(pwd)"
           
+          # ✅ 获取目标列表（逗号分隔）
           TARGETS='${{ steps.parse.outputs.TARGET_FILES }}'
-          echo "📂 正在读取目标文件: $TARGETS"
+          echo "📂 原始目标列表: $TARGETS"
           
-          # 创建临时JSON文件
+          # ✅ 创建临时 JSON 文件
           TEMP_JSON=$(mktemp)
           echo "[]" > "$TEMP_JSON"
           
-          IFS=',' read -ra PATHS <<< "$TARGETS"
-          for path in "${PATHS[@]}"; do
-            path=$(echo "$path" | xargs)
+          # ✅ 核心修复：将逗号转为换行，逐行读取
+          # 使用 process substitution 避免 subshell 问题
+          while IFS= read -r raw_path; do
+            # 去除首尾空白
+            path=$(echo "$raw_path" | xargs)
             
+            # 跳过空行
+            [ -z "$path" ] && continue
+            
+            echo "🔍 处理路径: '$path'"
+            
+            # 1. 通配符模式（查找已存在文件）
             if [[ "$path" == *"*"* ]]; then
-              MATCHED=$(find . -path "$path" -type f 2>/dev/null || true)
-            elif [ -f "$path" ]; then
-              MATCHED="$path"
-            elif [ -d "$path" ]; then
-              MATCHED=$(find "$path" -type f 2>/dev/null || true)
-              MATCHED=$(echo "$MATCHED" | grep -vE '(\.git|node_modules|__pycache__)')
-            else
-              continue
-            fi
+              echo "  🌟 通配符模式"
+              # 使用 find 查找，每个匹配单独处理
+              while IFS= read -r matched_file; do
+                [ -z "$matched_file" ] && continue
+                CODE_B64=$(base64 -w0 < "$matched_file" 2>/dev/null || echo "")
+                CODE_LEN=$(wc -c < "$matched_file" 2>/dev/null || echo "0")
+                echo "    📄 匹配文件: $matched_file"
+                jq --arg path "$matched_file" --arg content "$CODE_B64" --argjson size "$CODE_LEN" \
+                  '. += [{"path": $path, "size": $size, "content_b64": $content}]' \
+                  "$TEMP_JSON" > "$TEMP_JSON.tmp" && mv "$TEMP_JSON.tmp" "$TEMP_JSON"
+              done < <(find . -path "$path" -type f 2>/dev/null)
             
-            for file in $MATCHED; do
-              [ -z "$file" ] && continue
-              CODE_B64=$(base64 -w0 < "$file" 2>/dev/null)
-              CODE_LEN=$(wc -c < "$file" 2>/dev/null)
-              
-              # 追加到JSON数组
-              jq --arg path "$file" --arg content "$CODE_B64" --argjson size "$CODE_LEN" \
+            # 2. 目录模式（遍历其中文件）
+            elif [ -d "$path" ]; then
+              echo "  📁 目录模式"
+              while IFS= read -r matched_file; do
+                [ -z "$matched_file" ] && continue
+                CODE_B64=$(base64 -w0 < "$matched_file" 2>/dev/null || echo "")
+                CODE_LEN=$(wc -c < "$matched_file" 2>/dev/null || echo "0")
+                echo "    📄 包含文件: $matched_file"
+                jq --arg path "$matched_file" --arg content "$CODE_B64" --argjson size "$CODE_LEN" \
+                  '. += [{"path": $path, "size": $size, "content_b64": $content}]' \
+                  "$TEMP_JSON" > "$TEMP_JSON.tmp" && mv "$TEMP_JSON.tmp" "$TEMP_JSON"
+              done < <(find "$path" -type f 2>/dev/null | grep -vE '(\.git|node_modules|__pycache__)')
+            
+            # 3. 单个文件模式（存在或不存在）
+            else
+              if [ -f "$path" ]; then
+                echo "  ✅ 文件存在"
+                CODE_B64=$(base64 -w0 < "$path" 2>/dev/null || echo "")
+                CODE_LEN=$(wc -c < "$path" 2>/dev/null || echo "0")
+                echo "    📄 读取内容: $path"
+              else
+                echo "  ⚠️  文件不存在，将请求 AI 创建"
+                CODE_B64=""
+                CODE_LEN=0
+                echo "    📝 待创建: $path"
+              fi
+              jq --arg path "$path" --arg content "$CODE_B64" --argjson size "$CODE_LEN" \
                 '. += [{"path": $path, "size": $size, "content_b64": $content}]' \
                 "$TEMP_JSON" > "$TEMP_JSON.tmp" && mv "$TEMP_JSON.tmp" "$TEMP_JSON"
-            done
-          done
+            fi
+          done < <(echo "$TARGETS" | tr ',' '\n')
           
+          # ✅ 检查最终文件数
           FILE_COUNT=$(jq 'length' "$TEMP_JSON")
+          echo "📂 最终处理文件数: $FILE_COUNT"
           
           if [ "$FILE_COUNT" -eq 0 ]; then
             echo "❌ 未找到任何有效文件"
             exit 1
           fi
           
+          # ✅ 限制10个文件
           if [ "$FILE_COUNT" -gt 10 ]; then
             echo "⚠️  文件数超过10个，仅处理前10个"
             jq '.[0:10]' "$TEMP_JSON" > "$TEMP_JSON.tmp" && mv "$TEMP_JSON.tmp" "$TEMP_JSON"
             FILE_COUNT=10
           fi
           
-          # ✅ 关键修复：使用cat输出，避免缩进问题
+          # ✅ 输出到 GitHub Actions
           echo "FILES_JSON<<EOF" >> "$GITHUB_OUTPUT"
           cat "$TEMP_JSON" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
           
           rm -f "$TEMP_JSON"
-          echo "✅ 成功读取 $FILE_COUNT 个文件"
+          echo "✅ 成功处理 $FILE_COUNT 个文件"
       
       # ==========================================
       # Step 5: 调用Kimi API生成响应
