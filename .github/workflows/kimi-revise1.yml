@@ -92,6 +92,10 @@ jobs:
       - name: 读取当前文件
         id: current
         run: |
+
+          cd "${{ github.workspace }}"
+          echo "📍 当前工作目录: $(pwd)"
+          
           TARGETS='${{ steps.parse.outputs.TARGET_FILES }}'
           echo "📂 正在读取目标文件: $TARGETS"
           
