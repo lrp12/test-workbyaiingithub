@@ -1,50 +1,29 @@
 name: run-shell-and-commit
-
 on:
-  workflow_dispatch:
-    inputs:
-      target_file:
-        description: '要执行的 .sh 文件（仓库相对路径），留空则扫描全部 *.sh'
-        required: false
-        default: ''
-      output_dir:
-        description: '生成文件保存目录（仓库相对路径）'
-        required: true
-        default: 'generated'
+  issues:
+    types: [opened, edited]
 
 jobs:
   run-and-commit:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: read
+    if: contains(github.event.issue.body, '@kimi-bot run')
     steps:
-      - name: checkout
-        uses: actions/checkout@v4
-
-      - name: prepare output dir
-        run: mkdir -p "${{ github.event.inputs.output_dir }}"
-
-      - name: run shell scripts
-        run: |
+      - uses: actions/checkout@v4
+      - run: mkdir -p "${{ github.event.issue.body }}"
+      - run: |
           set -e
-          if [ -n "${{ github.event.inputs.target_file }}" ]; then
-            scripts="${{ github.event.inputs.target_file }}"
-          else
-            scripts=$(find . -name "*.sh" -type f)
-          fi
+          scripts=$(find . -name "*.sh" -type f)
           for s in $scripts; do
             echo "Running $s"
             bash "$s"
           done
-
-      - name: commit generated files
-        run: |
-          git config user.name  "github-actions[bot]"
+        env:
+          OUTPUT_DIR: "${{ github.event.issue.body }}"
+      - run: |
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ github.event.inputs.output_dir }}"
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Automated: save generated files"
-            git push
-          fi
+          git add .
+          git diff --cached --quiet || (git commit -m "Automated: save generated files" && git push)
