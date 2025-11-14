@@ -104,6 +104,8 @@ jobs:
           # cd "${{ github.workspace }}"
           cd ../
           ls -la
+          cd "${{ github.workspace }}"
+          ls -la
           TARGETS='${{ steps.parse.outputs.TARGET_FILES }}'
           echo "📂 原始目标: $TARGETS"
           echo "📍 当前目录: $(pwd)"
