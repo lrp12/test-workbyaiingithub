@@ -97,6 +97,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logging.info("用户中断，程序退出")
         sys.exit(0)
-
-requests
-win10toast
