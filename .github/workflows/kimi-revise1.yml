@@ -24,6 +24,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.head_ref }}
+          script:
+            echo "检出分支：${{ github.head_ref }}"
       
       # ==========================================
       # Step 2: 获取PR文件列表
