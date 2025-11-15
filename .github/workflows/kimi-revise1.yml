@@ -83,7 +83,15 @@ jobs:
           REVISE_REQ_B64=$(printf '%s' "$REVISE_REQ" | base64 -w0)
           echo "REVISE_REQ_B64=$REVISE_REQ_B64" >> "$GITHUB_OUTPUT"
           echo "💡 修改要求: '$REVISE_REQ'"
-      
+
+      - name: 验证检出分支
+        run: |
+          echo "🔀 检出分支: $(git branch --show-current)"
+          echo "📍 当前 HEAD: $(git rev-parse HEAD)"
+          echo "🌐 远程分支: $(git remote show origin | grep 'HEAD branch' | awk '{print $NF}')"
+          echo "📂 工作目录: $(pwd)"
+          echo "📜 最近提交: $(git log -1 --oneline)"
+
       # ==========================================
       # Step 4: ✅ 修复：使用临时文件避免here-document
       # 读取目标文件内容，构建JSON数组
@@ -106,6 +114,7 @@ jobs:
           set -e
           cd "${{ github.workspace }}"
           ls -la
+          
           
           # ✅ 输入参数（可能为空）
           TARGETS='${{ steps.parse.outputs.TARGET_FILES }}'
